@@ -176,3 +176,19 @@ def test_request_origin_and_private_files(web):
     assert client.post('/api/logout', headers={'origin': 'https://untrusted.example'}).status_code == 403
     for path in ('/app.sqlite3', '/var/app.sqlite3', '/.env', '/backups/backup.sqlite3', '/static/../app.sqlite3'):
         assert client.get(path).status_code == 404
+
+
+def test_pilot_enrollment_requires_admin_and_cannot_promote_mock_cases(web):
+    client, service = web
+    routes = ('/api/cases/any/pilot', '/api/cases/any/pilot-followups')
+    for route in routes:
+        assert client.post(route, json={'enabled': True}).status_code == 401
+    login(client, 'staff')
+    for route in routes:
+        assert client.post(route, json={'enabled': True}).status_code == 403
+    login(client)
+    for route in routes:
+        assert client.post(route, json={'enabled': 'true'}).status_code == 409
+        assert client.post(route, json={'enabled': True}).status_code == 409
+    assert client.get('/api/operations').json()['pilot']['enrolled_count'] == 0
+    assert service.settings()['operation_mode'] == 'verification'

@@ -119,7 +119,7 @@ function updateSaveStatus(buffer) {
   const conflictButton = $('[data-action=resolve-draft]');
   if (conflictButton) conflictButton.hidden = !buffer.conflict;
   const sendButton = $('[data-action=review-send]');
-  if (sendButton) sendButton.disabled = buffer.stale || buffer.conflict || !currentCase.email;
+  if (sendButton) sendButton.disabled = buffer.stale || buffer.conflict || !currentCase.email || !!currentCase.operational_status?.manual_send_blocked;
 }
 
 async function saveDraftBuffer(buffer, force=false) {
@@ -203,11 +203,11 @@ function draftHTML(draft,c) {
   const b = bufferFor(draft,c.id), meta = draft.generation_metadata || {};
   return `<form id="draft-form" data-id="${esc(draft.id)}" data-version="${Number(b.version)}">
     <div class="actions mb15">${statusPill(draft.status)}<span class="pill">${draft.provider==='mock'?'모의 응답 · 실제 GPT 생성 아님':'OpenAI 생성 초안'}</span></div>
-    ${draft.provider!=='mock'?`<p class="muted small-mb20">모델 ${esc(meta.model||draft.provider)} · ${fullFmt(meta.generated_at||draft.created_at)}${meta.request_id?` · 요청 ${esc(meta.request_id)}`:''}${meta.usage?.total_tokens?` · ${Number(meta.usage.total_tokens)} 토큰`:''}</p>`:''}
+    ${draft.provider!=='mock'?`<details class="generation-details"><summary>생성 정보</summary><p class="muted small-mb20">모델 ${esc(meta.model||draft.provider)} · ${fullFmt(meta.generated_at||draft.created_at)}${meta.request_id?` · 요청 ${esc(meta.request_id)}`:''}${meta.usage?.total_tokens?` · ${Number(meta.usage.total_tokens)} 토큰`:''}</p></details>`:''}
     ${draft.checks?.length?`<div class="notice amber"><strong>직원 확인 사항 · 고객 발송 본문에 포함되지 않음</strong><ul>${draft.checks.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:''}
     <label class="field">고객에게 보낼 답변<textarea name="body" rows="12" required>${esc(b.body)}</textarea></label>
     <div class="save-feedback"><span id="draft-save-status" role="status" aria-live="polite"></span><span id="draft-save-error" class="error-text"></span></div>
-    <div class="actions"><button class="btn" type="submit">지금 저장</button><button class="btn" type="button" data-action="resolve-draft" hidden>충돌 내용 비교</button><button class="btn primary" type="button" data-action="review-send" data-id="${esc(draft.id)}"${!c.email?' disabled':''}>${demo.enabled?'검토 후 모의 발송':'검토 후 발송'}</button></div>
+    <div class="actions"><button class="btn" type="submit">지금 저장</button><button class="btn" type="button" data-action="resolve-draft" hidden>충돌 내용 비교</button><button class="btn primary" type="button" data-action="review-send" data-id="${esc(draft.id)}"${!c.email||c.operational_status?.manual_send_blocked?' disabled':''}>${demo.enabled?'검토 후 모의 발송':'검토 후 발송'}</button></div>
     ${!c.email?'<p class="inline-feedback">이메일이 없는 고객입니다. 작성한 문구를 전화 상담에 사용해 주세요.</p>':''}
   </form>`;
 }
@@ -227,35 +227,76 @@ function latestInquiryHTML(c) {
   return `<section class="card latest-inquiry" id="latest-inquiry"><div class="card-header"><h2>최신 고객 문의</h2><span class="pill">${latest?.source==='phone'?'전화 상담':'이메일 문의'}</span></div><div class="card-body">${latest?`<dl class="definition"><dt>발신자</dt><dd>${esc(c.name||'')} ${esc(latest.sender||latest.email||c.email||c.phone||'')}</dd><dt>제목</dt><dd>${esc(latest.subject||c.subject||'전화 문의')}</dd><dt>수신 시각</dt><dd>${fullFmt(latest.received_at||latest.created_at)}</dd></dl><div class="message-body">${esc(latest.body)}</div>`:empty('문의 내용을 확인해 주세요','상담이력에 기록된 내용을 확인한 뒤 상태를 선택해 주세요.')}</div></section>`;
 }
 
+function requiredFollowupFields(c) {
+  const pending=(c.jobs||[]).filter(job=>['pending','staff_check'].includes(job.status));
+  const sources=pending.length?pending.map(job=>{
+    const template=templates.find(item=>item.id===job.template_id);
+    return template?.history?.find(item=>Number(item.version)===Number(job.template_version))||template;
+  }).filter(Boolean):templates.filter(item=>item.state===c.state&&['approved','승인 완료'].includes(item.approval));
+  return [...new Set(sources.flatMap(item=>[...(String(item.body||'')+' '+String(item.conditions||'')).matchAll(/\[([^\]]+)\]/g)].map(match=>match[1])))];
+}
+
 function caseInfoHTML(c) {
-  const cu = c.customer || c;
-  return `<section class="card"><div class="card-header"><h2>상담 정보 · 연락 조건</h2>${statusPill(c.workflow)}</div><div class="card-body"><form id="case-form">
-    <label class="field">고객 이름<input name="name" value="${esc(c.name||cu.name||'')}" required></label>
-    <label class="field">이메일<input name="email" type="email" value="${esc(c.email||cu.email||'')}"></label>
-    <label class="field">전화번호<input name="phone" type="tel" value="${esc(c.phone||cu.phone||'')}"></label>
-    <label class="field">담당 직원<input name="owner" value="${esc(c.owner||'')}"></label>
-    <label class="field">업무 처리 상태<select name="workflow">${!['consulting','staff_check','paused','closed'].includes(c.workflow)?`<option value="${esc(c.workflow)}" selected>${esc(labels[c.workflow]||c.workflow)}</option>`:''}${[['consulting','상담 진행'],['staff_check','직원 확인 대기'],['paused','보류'],['closed','상담 종료']].map(([s,n])=>`<option value="${s}"${selected(c.workflow,s)}>${n}</option>`).join('')}</select></label>
-    <label class="checkbox"><input type="checkbox" name="company_owes_info"${check(c.company_owes_info)}>회사가 운영정보를 확인해 답해야 합니다. 고객 무응답 후속을 시작하지 않습니다.</label>
-    <label class="checkbox"><input type="checkbox" name="email_allowed"${check(cu.email_allowed||c.email_allowed)}>이메일 후속 연락이 허용됨을 확인했습니다.</label>
-    <label class="field">연락 허용 근거 · 확인 내역<textarea name="consent_note" rows="2">${esc(cu.consent_note||'')}</textarea></label>
-    <label class="checkbox"><input type="checkbox" name="opt_out"${check(cu.opt_out||c.opt_out)}>고객이 이메일 연락 중단을 요청했습니다.</label>
-    <details class="section-gap"${c.state==='S6'?' open':''}><summary>확인된 프로젝트 정보 · 신청 및 결제</summary><p class="muted small-helper">확인한 정보만 입력하세요. 필요한 치환값이 없으면 후속 발송을 보류합니다.</p>
-    ${['프로젝트명','A 프로젝트','B 프로젝트','핵심 조건','일정','기간','예산'].map(k=>`<label class="field">${esc(k)}<input name="field:${esc(k)}" value="${esc((c.fields||{})[k]||'')}"></label>`).join('')}
-    <label class="field">신청·결제 확인 결과<select name="payment">${[['unknown','상태 확인 전'],['incomplete','미완료 확인'],['complete','신청·결제 완료'],['stopped','신청·결제 중단']].map(([s,n])=>`<option value="${s}"${selected(c.payment,s)}>${n}</option>`).join('')}</select><small>최근 확인: ${fullFmt(c.payment_checked_at)}<br>S6 발송에는 최신 미완료 확인과 개별 승인이 필요합니다.</small></label></details>
-    <label class="field section-gap">내부 참고사항<textarea name="notes" rows="3">${esc(c.notes||'')}</textarea></label>
-    <button class="btn primary full-width" type="submit">상담 정보 저장</button><small>답변 편집 내용은 별도로 자동 저장됩니다.</small>
+  const cu=c.customer||c, fields=c.fields||{};
+  const requiredFields=requiredFollowupFields(c);
+  const missing=requiredFields.filter(key=>!String(fields[key]||'').trim());
+  const allFields=[...new Set([...Object.keys(fields),...requiredFields,'프로젝트명','A 프로젝트','B 프로젝트','핵심 조건','일정','기간','예산'])];
+  const paymentField=`<label class="field">신청·결제 확인 결과<select name="payment">${[['unknown','상태 확인 전'],['incomplete','미완료 확인'],['complete','신청·결제 완료'],['stopped','신청·결제 중단']].map(([key,title])=>`<option value="${key}"${selected(c.payment,key)}>${title}</option>`).join('')}</select><small>최근 확인: ${fullFmt(c.payment_checked_at)}</small></label>`;
+  return `<section class="card" id="case-conditions"><div class="card-header"><h2>확인할 항목</h2></div><div class="card-body"><form id="case-form">
+    <div class="contact-facts"><strong>${esc(c.name||cu.name||'이름 미등록')}</strong><span>${esc(c.email||cu.email||c.phone||'연락처 미등록')}</span>${c.owner?`<small>담당 ${esc(c.owner)}</small>`:''}</div>
+    <label class="checkbox"><input type="checkbox" name="email_allowed"${check(cu.email_allowed||c.email_allowed)}>이메일 후속 연락 허용 확인</label>
+    ${cu.consent_note?`<p class="muted consent-summary">확인 근거: ${esc(cu.consent_note)}</p><details class="compact-details"><summary>연락 허용 근거 수정</summary><label class="field"><textarea name="consent_note" rows="2">${esc(cu.consent_note)}</textarea></label></details>`:`<label class="field">연락 허용 근거<textarea name="consent_note" rows="2" placeholder="수신 동의 등 확인한 근거를 기록하세요."></textarea></label>`}
+    <label class="checkbox"><input type="checkbox" name="opt_out"${check(cu.opt_out||c.opt_out)}>고객이 연락 중단을 요청함</label>
+    <label class="checkbox"><input type="checkbox" name="company_owes_info"${check(c.company_owes_info)}>회사가 확인한 뒤 답해야 함</label><p class="muted small-helper">선택하면 고객 무응답 후속을 시작하지 않습니다.</p>
+    ${missing.length?`<div class="required-conditions"><h3>후속 발송에 필요한 정보</h3><p class="muted small-helper">확인된 항목만 입력하세요. 모르는 정보는 비워 두고 직원 확인 업무로 남깁니다.</p>${missing.map(key=>`<label class="field">${esc(key)}<input name="field:${esc(key)}" value=""></label>`).join('')}</div>`:''}
+    ${c.state==='S6'?`<div class="required-conditions"><h3>신청·결제 확인</h3><p class="muted small-helper">S6 후속은 최신 미완료 확인과 건별 직원 승인 후에만 발송합니다.</p>${paymentField}</div>`:''}
+    <details class="compact-details contact-details"><summary>고객정보 · 프로젝트 상세 수정</summary>
+      <label class="field">고객 이름<input name="name" value="${esc(c.name||cu.name||'')}" required></label>
+      <label class="field">이메일<input name="email" type="email" value="${esc(c.email||cu.email||'')}"></label>
+      <label class="field">전화번호<input name="phone" type="tel" value="${esc(c.phone||cu.phone||'')}"></label>
+      <label class="field">담당 직원<input name="owner" value="${esc(c.owner||'')}"></label>
+      ${allFields.filter(key=>!missing.includes(key)).map(key=>`<label class="field">${esc(key)}<input name="field:${esc(key)}" value="${esc(fields[key]||'')}"></label>`).join('')}
+      ${c.state!=='S6'?paymentField:''}
+    </details>
+    <details class="compact-details"><summary>내부 참고사항${c.notes?' · 기록 있음':''}</summary><label class="field"><textarea name="notes" rows="3">${esc(c.notes||'')}</textarea></label></details>
+    <button class="btn full-width" type="submit">상담 정보 저장</button><small>답변은 별도로 자동 저장됩니다.</small>
   </form></div></section>`;
 }
 
+function nextContactHTML(c) {
+  const activeJobs=(c.jobs||[]).filter(job=>['pending','staff_check'].includes(job.status)).sort((a,b)=>Date.parse(a.due_at)-Date.parse(b.due_at));
+  const next=activeJobs[0];
+  const operational=c.operational_status||{};
+  const blockers=[...new Set(operational.blockers||[])];
+  const nextAction=operational.next_action||(!c.state||c.selected_generation!==c.generation?'최신 문의를 읽고 고객 상태를 선택해 주세요.':c.drafts?.some(d=>d.status==='draft')?'답변을 검토하고 승인해 주세요.':next?'다음 연락 일정과 고객 답장 여부를 확인하세요.':'필요한 답변을 작성해 상담을 이어가세요.');
+  return `<section class="card" id="next-followup"><div class="card-header"><h2>다음 연락 · 진행 상황</h2><button class="btn small" data-action="${c.followup_mode==='paused'?'resume-case':'pause-case'}"${!['active','paused'].includes(c.followup_mode)?' disabled':''}>${c.followup_mode==='paused'?'후속 재개':'후속 일시중지'}</button></div><div class="card-body compact-body">
+    <div class="next-contact-summary"><div><small>다음 연락 예정</small><strong>${next?fullFmt(next.due_at):'예정된 후속 연락 없음'}</strong></div><div><small>현재 진행</small>${statusPill(c.workflow)}</div></div>
+    ${blockers.length?`<div class="notice amber followup-blockers"><strong>발송 전 확인 필요</strong><ul>${blockers.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></div>`:''}
+    <p class="next-task"><strong>다음 할 일</strong> ${esc(nextAction)}</p>
+    ${next&&(next.activation_review_required||String(next.template_id).startsWith('S6'))?`<button class="btn section-gap" data-action="review-job" data-id="${esc(next.id)}">다음 예약 문구 확인·승인</button>`:''}
+    <details class="compact-details schedule-details"><summary>전체 예약 ${c.jobs?.length||0}건 · 발송·취소 기록</summary>${jobTable(c.jobs||[],true)}</details>
+  </div></section>`;
+}
+
+
+function pilotToolsHTML(c) {
+  if(user.role!=='admin'||settings.mode!=='live'||c.purpose==='verification')return '';
+  const limited=settings.operation_mode==='limited';
+  return `<details class="card admin-extras"><summary class="card-body">관리자 · 제한 운영 ${c.pilot_enrolled?'대상 등록됨':'대상 설정'}</summary><div class="card-body"><p class="muted small-mb20">제한 운영은 관리자가 지정한 실제 상담 최대 5건에만 적용합니다. 자동 후속은 고객별로 따로 허용해야 합니다.</p>
+    ${!limited?'<div class="notice">관리자 설정에서 제한 운영 단계를 선택한 뒤 등록할 수 있습니다.</div>':''}
+    <dl class="definition"><dt>운영 대상</dt><dd>${c.pilot_enrolled?'등록됨':'미등록'}</dd><dt>자동 후속</dt><dd>${c.pilot_followups_enabled?'개별 허용됨':'개별 허용 전'}</dd><dt>문구 승인</dt><dd>${Number(c.operational_status?.approved_template_count||0)} / ${Number(c.operational_status?.total_template_count||0)}개 · 미승인 문구는 계속 보류</dd>${c.pilot_enrolled_at?`<dt>등록 확인</dt><dd>${fullFmt(c.pilot_enrolled_at)} · ${esc(c.pilot_enrolled_by||'')}</dd>`:''}</dl>
+    <div class="actions"><button class="btn" data-action="pilot-enrollment" data-enabled="${c.pilot_enrolled?'false':'true'}"${!limited?' disabled':''}>${c.pilot_enrolled?'제한 운영 대상 해제':'이 상담을 제한 운영에 등록'}</button><button class="btn" data-action="pilot-followups" data-enabled="${c.pilot_followups_enabled?'false':'true'}"${!limited||!c.pilot_enrolled?' disabled':''}>${c.pilot_followups_enabled?'이 고객 자동 후속 중지':'이 고객 자동 후속 허용'}</button></div>
+    <p class="muted small-mt14">후속 허용 전 연락 동의, 사용할 승인 문구와 치환 정보, 최근 직원 답장의 실제 발송을 확인합니다. 문구 승인 상태는 변경하지 않습니다.</p></div></details>`;
+}
 
 function verificationToolsHTML(c) {
   if(user.role!=='admin'||settings.mode!=='live')return '';
-  return `<section class="card"><div class="card-header"><h2>실제 연결 확인용 상담</h2></div><div class="card-body"><p class="muted small-mb20">관리자가 지정한 확인용 수신 주소에만 적용합니다. 일반 고객의 예약과 분리하여 확인합니다.</p>${c.purpose==='verification'?'<span class="pill amber">별도 검증 상담</span><div class="actions section-gap"><button class="btn" data-action="verification-followup">확인용 후속 예약 1건</button></div>':'<button class="btn" data-action="mark-verification">확인용 상담으로 지정</button>'}</div></section>`;
+  return `<details class="card admin-extras"><summary class="card-body">관리자 · 실제 연결 확인용 상담</summary><div class="card-body"><p class="muted small-mb20">관리자가 지정한 확인용 수신 주소에만 적용합니다. 일반 고객의 예약과 분리하여 확인합니다.</p>${c.purpose==='verification'?'<span class="pill amber">별도 검증 상담</span><div class="actions section-gap"><button class="btn" data-action="verification-followup">확인용 후속 예약 1건</button></div>':'<button class="btn" data-action="mark-verification">확인용 상담으로 지정</button>'}</div></details>`;
 }
 
 async function renderCase(id) {
   await refreshDemo(id);
-  currentCase = await api(`/cases/${encodeURIComponent(id)}`);
+  [currentCase,templates] = await Promise.all([api(`/cases/${encodeURIComponent(id)}`),api('/templates')]);
   const c=currentCase, drafts=c.drafts||[], draft=drafts.find(d=>d.status==='draft');
   jobs=c.jobs||[];
   const oldDemo=demo.enabled; demo.enabled=false;
@@ -267,11 +308,11 @@ async function renderCase(id) {
       <section class="card" id="state-section"><div class="card-header"><h2>직원 상태 선택</h2>${statePill(c.state)}</div><div class="card-body">
       ${c.selected_generation!==c.generation?'<div class="notice amber">최신 문의를 읽고 상태를 다시 선택해 주세요. 이전 초안은 보존되지만 새 문의에 그대로 발송할 수 없습니다.</div>':'<p class="muted">같은 상태를 다시 저장해도 기존 예약과 기준 발송일은 유지됩니다.</p>'}
       <form id="state-form"><div class="state-grid">${Object.entries(stages).map(([s,n])=>`<label class="state-radio"><input type="radio" name="state" value="${s}"${check(c.state===s)} required><span><b>${s}</b>${n}</span></label>`).join('')}</div><button type="submit" class="btn primary">상태 저장</button></form></div></section>
-      <section class="card" id="answer-section"><div class="card-header"><div><h2>답변 생성 · 편집 · 발송</h2><small>직원이 검토한 최종본만 발송합니다.</small></div><button class="btn" data-action="generate-draft"${!c.state||c.selected_generation!==c.generation?' disabled':''}>${draft?'답변 재생성':'답변 생성'}</button></div><div class="card-body">${draftHTML(draft,c)}${archivedDraftsHTML(drafts)}</div></section>
-      <section class="card" id="next-followup"><div class="card-header"><div><h2>다음 후속 연락</h2><small>상담 답변이 정상 발송된 시각을 기준으로 합니다.</small></div><button class="btn" data-action="${c.followup_mode==='paused'?'resume-case':'pause-case'}"${!['active','paused'].includes(c.followup_mode)?' disabled':''}>${c.followup_mode==='paused'?'후속 재개':'후속 일시중지'}</button></div><div class="card-body compact-body"><p class="muted">현재 ${esc(labels[c.followup_mode]||c.followup_mode)}${c.company_owes_info?' · 회사 확인 답변 필요':''}</p></div>${jobTable(jobs,true)}</section>
-      <section class="card" id="full-history"><div class="card-header"><h2>전체 상담이력</h2><small>${(c.history||[]).length}개의 기록</small></div><div class="card-body">${historyHTML(c.history)}</div></section>
+      <section class="card" id="answer-section"><div class="card-header"><div><h2>답변 생성 · 편집 · 발송</h2><small>직원이 검토한 최종본만 발송합니다.</small></div><button class="btn" data-action="generate-draft"${!c.state||c.selected_generation!==c.generation||c.operational_status?.generation_blocked?' disabled':''}>${draft?'답변 재생성':'답변 생성'}</button></div><div class="card-body"><div id="generation-block" class="notice amber" role="status"${c.operational_status?.generation_blocked?'':' hidden'}>${esc(c.operational_status?.generation_block_reason||'')}</div>${draftHTML(draft,c)}${archivedDraftsHTML(drafts)}</div></section>
+      ${nextContactHTML(c)}
+      <details class="card" id="full-history"><summary class="card-body">전체 상담이력 · ${(c.history||[]).length}개의 기록</summary><div class="card-body">${historyHTML(c.history)}</div></details>
       ${c.state_history?.length?`<details class="card"><summary class="card-body">직원 상태 선택 이력</summary><div class="card-body"><ul class="compact-list">${c.state_history.map(s=>`<li>${statePill(s.state)} <span class="muted">${esc(s.actor||s.selected_by||'')} · ${fullFmt(s.created_at||s.selected_at)}</span></li>`).join('')}</ul></div></details>`:''}
-    </div><aside>${caseInfoHTML(c)}${verificationToolsHTML(c)}${(c.outbox||[]).some(o=>['uncertain','sending'].includes(o.status))?`<section class="card"><div class="card-header"><h2>발송 결과 확인</h2></div><div class="card-body"><div class="notice amber">전송 여부가 확인될 때까지 추가 발송을 보류합니다.</div>${c.outbox.filter(o=>['uncertain','sending'].includes(o.status)).map(o=>`<p>${statusPill(o.status)} <button class="btn small" data-action="reconcile" data-id="${esc(o.id)}">Gmail 기록 확인</button></p>`).join('')}</div></section>`:''}</aside></div>`;
+    </div><aside>${caseInfoHTML(c)}${pilotToolsHTML(c)}${verificationToolsHTML(c)}${(c.outbox||[]).some(o=>['uncertain','sending'].includes(o.status))?`<section class="card"><div class="card-header"><h2>발송 결과 확인</h2></div><div class="card-body"><div class="notice amber">전송 여부가 확인될 때까지 추가 발송을 보류합니다.</div>${c.outbox.filter(o=>['uncertain','sending'].includes(o.status)).map(o=>`<p>${statusPill(o.status)} <button class="btn small" data-action="reconcile" data-id="${esc(o.id)}">Gmail 기록 확인</button></p>`).join('')}</div></section>`:''}</aside></div>`;
   if(draft)updateSaveStatus(draftBuffers.get(draft.id));
 }
 
@@ -310,13 +351,13 @@ async function renderSettings() {
     <label class="field">발송 가능한 요일</label><div class="actions">${['월','화','수','목','금','토','일'].map((d,i)=>`<label class="checkbox"><input name="weekday" type="checkbox" value="${i}"${check((settings.weekdays||[0,1,2,3,4]).includes(i))}>${d}</label>`).join('')}</div>
     <label class="field">고객정보 보관기간 (일)<input name="retention_days" type="number" min="1" max="3650" value="${esc(settings.retention_days||365)}" required><small>삭제 실행과 백업 보관은 관리자 운영 절차를 따릅니다.</small></label>
     <label class="checkbox"><input name="legal_review_confirmed" type="checkbox"${check(settings.legal_review_confirmed)}>회사의 연락 및 광고성 이메일 발송 조건 검토를 완료했습니다.</label><hr class="divider">
-    <label class="field">실제 연동 단계<select name="operation_mode"${settings.mode!=='live'?' disabled':''}><option value="verification"${selected(settings.operation_mode||'verification','verification')}>지정 수신자 연결 검증</option><option value="production"${selected(settings.operation_mode,'production')}>실제 운영</option></select></label>
+    <label class="field">실제 연동 단계<select name="operation_mode"${settings.mode!=='live'?' disabled':''}><option value="verification"${selected(settings.operation_mode||'verification','verification')}>지정 수신자 연결 검증</option><option value="limited"${selected(settings.operation_mode,'limited')}>제한 운영 · 지정한 상담 최대 5건</option><option value="production"${selected(settings.operation_mode,'production')}>실제 운영</option></select></label>
     <label class="field">확인용 실제 수신 주소<input type="email" name="verification_recipient" value="${esc(settings.verification_recipient||'')}"${settings.mode!=='live'?' disabled':''}><small>본인이 사용할 실제 확인용 주소를 지정하세요. 별도 검증 상담에만 적용합니다.</small></label>
     <label class="checkbox"><input name="live_enabled" type="checkbox"${check(settings.live_enabled)}${settings.mode!=='live'?' disabled':''}>직원 승인 답장의 실제 Gmail 발송 활성화</label>
     <label class="checkbox"><input name="auto_followups_paused" type="checkbox"${check(settings.auto_followups_paused)}>전체 자동 후속 일시중지</label>
     <p class="muted small-mb20">연결 검증과 발송 조건 확인을 마친 뒤 활성화합니다. 실제 운영 전환은 확인용 메일 수신·답변·후속 발송 기록을 검토한 뒤 선택하세요.</p>
     <button class="btn primary" type="submit">운영 설정 저장</button></form><hr class="divider"><button class="btn danger" data-action="pause-all-followups">전체 자동 후속 중지</button><p class="muted small-mt14">새 자동 후속 발송만 중지합니다. 고객 상담과 기존 예약 기록은 보존됩니다.</p></div></section>
-    <section class="card"><div class="card-header"><h2>실행 상태 · 활성화 확인</h2><button class="btn small" data-action="refresh">새로고침</button></div><div class="card-body"><dl class="definition"><dt>최근 수신 성공</dt><dd>${fullFmt(operations.telemetry?.gmail_poll?.last_success_at)}</dd><dt>최근 예약 실행</dt><dd>${fullFmt(operations.telemetry?.scheduler?.last_success_at)}</dd><dt>수신 오류</dt><dd>${esc(operations.telemetry?.gmail_poll?.error||'없음')}</dd><dt>예약 오류</dt><dd>${esc(operations.telemetry?.scheduler?.error||'없음')}</dd><dt>예약 실행기</dt><dd>${operations.scheduler_enabled?'실행 설정됨':'중지됨'}</dd></dl>${operations.activation?.missing?.length?`<div class="notice amber"><strong>실제 운영 전 확인할 항목</strong><ul>${operations.activation.missing.map(item=>`<li>${esc(activationLabels[item]||'추가 실제 연결 검증')}</li>`).join('')}</ul></div>`:''}</div></section>
+    <section class="card"><div class="card-header"><h2>실행 상태 · 활성화 확인</h2><button class="btn small" data-action="refresh">새로고침</button></div><div class="card-body"><dl class="definition"><dt>최근 수신 성공</dt><dd>${fullFmt(operations.telemetry?.gmail_poll?.last_success_at)}</dd><dt>최근 예약 실행</dt><dd>${fullFmt(operations.telemetry?.scheduler?.last_success_at)}</dd><dt>수신 오류</dt><dd>${esc(operations.telemetry?.gmail_poll?.error||'없음')}</dd><dt>예약 오류</dt><dd>${esc(operations.telemetry?.scheduler?.error||'없음')}</dd><dt>예약 실행기</dt><dd>${operations.scheduler_enabled?'실행 설정됨':'중지됨'}</dd><dt>최근 백업 성공</dt><dd>${fullFmt(operations.telemetry?.backup?.last_success_at)}</dd><dt>백업 오류</dt><dd>${esc(operations.telemetry?.backup?.error||'없음')}</dd><dt>최근 메일 등록 지연</dt><dd>${Number.isFinite(operations.telemetry?.gmail_poll?.details?.last_reception_latency_seconds)?Number(operations.telemetry.gmail_poll.details.last_reception_latency_seconds).toFixed(1)+'초 · 메일 수신 시각부터 사이트 등록까지':'측정된 새 메일 없음'}</dd></dl>${operations.activation?.missing?.length?`<div class="notice amber"><strong>실제 운영 전 확인할 항목</strong><ul>${operations.activation.missing.map(item=>`<li>${esc(activationLabels[item]||'추가 실제 연결 검증')}</li>`).join('')}</ul></div>`:''}</div></section>
     </div><div>
     <section class="card"><div class="card-header"><h2>Gmail 연결 · 수집 범위</h2></div><div class="card-body">
     <dl class="definition"><dt>등록된 계정</dt><dd>${esc(gmail.account_email||operations.sender||'연결 대기')}</dd><dt>OAuth 승인정보</dt><dd>${gmail.authorization_saved?'서버에 보관됨':'등록되지 않음'}</dd><dt>실제 Gmail 조회</dt><dd>${gmail.reconnect_required?'재연결 필요':gmail.read_verified?'현재 연결 조회 성공':gmail.authorization_saved?'승인정보 있음 · 실제 조회 확인 대기':gmail.mode==='mock'?'모의 모드 · 실제 연결 없음':'Google 인증 필요'}</dd><dt>최근 조회 검증</dt><dd>${fullFmt(gmail.last_read_verified_at)}</dd><dt>최근 수신 성공</dt><dd>${fullFmt(gmail.last_sync?.last_success_at)}</dd><dt>최근 수신 시도</dt><dd>${fullFmt(gmail.last_sync?.last_attempt_at)}</dd><dt>인증 복귀 주소</dt><dd>${esc(gmail.redirect_uri||'서버의 공개 HTTPS 주소 설정 필요')}</dd><dt>연결·수신 오류</dt><dd>${esc(gmail.error||gmail.last_sync?.error||'없음')}</dd></dl>
@@ -402,26 +443,33 @@ async function saveState(data) {
   toast(preview.changed?'직원이 선택한 상태를 저장했습니다.':'같은 상태를 유지했습니다. 기존 예약과 발송 기준일은 그대로입니다.');
 }
 
+function updateGenerationStatus(c) {
+  const button=$('[data-action=generate-draft]');
+  const notice=$('#generation-block');
+  const blocked=!!c.operational_status?.generation_blocked;
+  if(button)button.disabled=!c.state||c.selected_generation!==c.generation||blocked;
+  if(notice){notice.hidden=!blocked;notice.textContent=c.operational_status?.generation_block_reason||'';}
+}
+
 async function saveCaseInfo(form,data,fd) {
   const fields={...(currentCase.fields||{})};
   for(const[k,v]of fd)if(k.startsWith('field:'))fields[k.slice(6)]=v;
-  const paymentChanged=data.payment!==currentCase.payment;
-  const changesFollowups=(fd.has('opt_out')&&!currentCase.customer?.opt_out)||(paymentChanged&&['complete','stopped'].includes(data.payment))||(['closed','paused'].includes(data.workflow)&&data.workflow!==currentCase.workflow);
+  const paymentChanged=fd.has('payment')&&data.payment!==currentCase.payment;
+  const changesFollowups=(fd.has('opt_out')&&!currentCase.customer?.opt_out)||(paymentChanged&&['complete','stopped'].includes(data.payment));
   const pending=(currentCase.jobs||[]).filter(j=>!['sent','cancelled','canceled','uncertain','sending'].includes(j.status));
   if(changesFollowups&&pending.length&&!window.confirm(`연락 조건 변경으로 후속 예약 ${pending.length}건이 중지되거나 취소됩니다.\n${affectedJobText(pending)}\n변경 내용을 저장할까요?`))return;
   const result=await api(`/cases/${currentCase.id}`,'PATCH',{
     name:data.name,email:data.email||null,phone:data.phone,owner:data.owner,
-    ...(['consulting','staff_check','paused','closed'].includes(data.workflow)?{workflow:data.workflow}:{}),
     email_allowed:fd.has('email_allowed'),opt_out:fd.has('opt_out'),consent_note:data.consent_note,
     fields,notes:data.notes,company_owes_info:fd.has('company_owes_info'),...(paymentChanged?{payment:data.payment}:{})
   });
   currentCase=result;
   jobs=result.jobs||jobs;
-  // Only update the schedules: the answer editor is deliberately not replaced.
-  const schedules=$('#next-followup .table-wrap')||$('#next-followup .empty');
-  if(schedules)schedules.outerHTML=jobTable(jobs,true);
-  const followupNote=$('#next-followup .compact-body p');
-  if(followupNote)followupNote.textContent=`현재 ${labels[result.followup_mode]||result.followup_mode}${result.company_owes_info?' · 회사 확인 답변 필요':''}`;
+  updateGenerationStatus(result);
+  // The answer editor is deliberately not replaced when contact information is saved.
+  const schedule=$('#next-followup');
+  const scheduleOpen=!!$('#next-followup .schedule-details')?.open;
+  if(schedule){schedule.outerHTML=nextContactHTML(result);const details=$('#next-followup .schedule-details');if(details)details.open=scheduleOpen;}
   const buffer=draftBuffers.get($('#draft-form')?.dataset.id);
   if(buffer) {
     const updated=result.drafts?.find(d=>d.id===buffer.id);
@@ -515,6 +563,16 @@ document.addEventListener('click',event=>{
       case 'sheets-sync':{
         const result=await api('/sheets/sync','POST',{});toast(result.message||'Google Sheets 보고 데이터를 동기화했습니다.');break;
       }
+      case 'pilot-enrollment':{
+        const enabled=button.dataset.enabled==='true';
+        if(!window.confirm(`${currentCase.name||'고객'} · ${currentCase.email||'이메일 없음'}\n\n${enabled?'이 상담을 최대 5건의 상담 제한 운영 대상으로 등록할까요? 직원 승인 발송만 가능하며 자동 후속은 별도로 허용해야 합니다.':'제한 운영 대상을 해제할까요? 이 고객의 새로운 실제 발송을 차단합니다.'}`))return;
+        await api(`/cases/${currentCase.id}/pilot`,'POST',{enabled});await renderCase(currentCase.id);toast(enabled?'제한 운영 대상에 등록했습니다.':'제한 운영 대상에서 해제했습니다.');break;
+      }
+      case 'pilot-followups':{
+        const enabled=button.dataset.enabled==='true';
+        if(!window.confirm(`${currentCase.name||'고객'} · ${currentCase.email||'이메일 없음'}\n\n${enabled?'이 고객의 무응답 자동 후속을 허용할까요? 현재 선택 상태의 승인 문구와 확인된 발송 조건만 사용합니다. S6은 건별 승인이 계속 필요합니다.':'이 고객의 새로운 자동 후속 발송을 중지할까요? 상담과 기존 기록은 보존됩니다.'}`))return;
+        await api(`/cases/${currentCase.id}/pilot-followups`,'POST',{enabled});await renderCase(currentCase.id);toast(enabled?'이 고객의 자동 후속을 개별 허용했습니다.':'이 고객의 자동 후속을 중지했습니다.');break;
+      }
       case 'mark-verification':
         if(!window.confirm('관리자 설정의 확인용 실제 수신 주소와 일치하는 별도 검증 상담으로 지정합니다. 계속할까요?'))return;
         await api(`/cases/${currentCase.id}/verification`,'POST',{});await renderCase(currentCase.id);toast('확인용 검증 상담으로 지정했습니다.');break;
@@ -579,6 +637,7 @@ document.addEventListener('submit',async event=>{
         const payload={business_start:Number(data.business_start),business_end:Number(data.business_end),weekdays:fd.getAll('weekday').map(Number),retention_days:Number(data.retention_days),legal_review_confirmed:fd.has('legal_review_confirmed'),live_enabled:fd.has('live_enabled'),auto_followups_paused:fd.has('auto_followups_paused')};
         if(settings.mode==='live'){payload.operation_mode=data.operation_mode;payload.verification_recipient=data.verification_recipient||'';}
         if(!payload.weekdays.length)throw new Error('발송 가능한 요일을 하나 이상 선택하세요.');
+        if(payload.operation_mode==='limited'&&settings.operation_mode!=='limited'&&!window.confirm('실제 연결 검증 기록을 확인했습니까? 관리자가 지정하는 최대 5건의 상담 제한 운영으로 전환합니다. 자동 후속은 고객별로 별도 허용해야 합니다.'))return;
         if(payload.operation_mode==='production'&&settings.operation_mode!=='production'&&!window.confirm('실제 연결 검증과 확인용 발송 기록을 확인했습니까? 승인된 범위의 실제 운영으로 전환합니다.'))return;
         await api('/settings','PUT',payload);await renderSettings();toast('운영 설정을 저장했습니다.');break;
       }

@@ -1,29 +1,25 @@
 # 실제 Gmail·OpenAI 연결과 제한된 발송 확인
 
 현재 상태는 **코드 구현·모의 API 검증 완료, 실제 인증·외부 API 검증 대기**입니다.
-호스팅 계정과 도메인은 아직 없으며 Gmail 계정이나 OpenAI 키를 추측해 연결하지 않았습니다.
+현재 우선 배포 대상은 Render입니다. 연결된 Render 계정은 없으며 Gmail 계정이나 OpenAI 키를 추측해 연결하지 않았습니다. 별도 도메인 없이 Render가 실제 발급한 기본 HTTPS 주소로 제한 시험을 준비합니다.
 사용자가 지정한 확인용 수신 주소는 배포 후 관리자 화면에 등록합니다. 코드에 고정하지 않습니다.
 
 `app.demo`는 계속 모의 실행 전용입니다. 실제 연동은 별도 운영 데이터 디렉터리와 `app.main`을
-사용합니다. `.env`는 자동으로 읽지 않습니다. [배포 안내](DEPLOYMENT.md)의 systemd가
-서버의 `/etc/gapyear/service.env`를 읽도록 설정되어 있습니다. 비밀값은 서버 편집기·호스팅의
-Secret 설정에서만 입력하고 채팅, 소스, 일반 로그, 브라우저 저장소에 넣지 않습니다.
+사용합니다. `.env`는 자동으로 읽지 않습니다. [Render 배포 안내](RENDER_DEPLOYMENT.md)에 따라 해당 서비스의 **Environment**에 비밀값을 등록합니다. Render에서는 `/var/data` 영속 디스크를 사용합니다. 대안인 VPS에서는 [별도 배포 안내](DEPLOYMENT.md)의 systemd 환경 파일을 사용합니다. 비밀값은 호스팅의 Secret 설정이나 서버 편집기에만 입력하며 채팅·소스·일반 로그·브라우저 저장소에 넣지 않습니다.
 
 ## 사용자가 준비할 항목
 
 | 준비할 것 | 생성·선택하는 화면 | 안전하게 넣을 위치 | 입력 후 확인 | 성공 표시 |
 | --- | --- | --- | --- | --- |
-| 상시 운영 서버와 도메인 | 선택한 호스팅의 서버 생성·영속 디스크·DNS 화면 | 서버 설치 후 `APP_BASE_URL`, Caddy의 `GAPYEAR_DOMAIN` | HTTPS를 다른 네트워크에서 열기 | 로그인 화면, 유효한 인증서 |
-| Google OAuth 웹 클라이언트 | Google Cloud Console → 프로젝트 → Gmail API 사용 설정 → Google Auth Platform의 Branding/Audience/Data Access/Clients | `/etc/gapyear/service.env`의 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | 재시작 후 관리자 → Gmail 연결 | Google 계정 선택 화면 |
-| 연결할 Gmail 계정 승인 | 사이트의 Gmail 연결 → Google의 계정 선택·권한 승인 | 앱이 `/var/lib/gapyear-secrets/gmail-token.json`에 자동 저장 | 앱으로 돌아온 뒤 실제 요청으로 연결 검증 | 실제 계정 주소·Gmail 조회 성공 시각 |
+| Render 웹 서비스·영속 디스크 | Render → New → Blueprint → 기존 저장소·검수 브랜치 | `render.yaml`; 시작 시 실제 `RENDER_EXTERNAL_URL`을 `APP_BASE_URL`로 반영 | 비용 승인 후 생성, Live 상태와 HTTPS 외부 접속 확인 | 로그인 화면, 유효한 인증서 |
+| Google OAuth 웹 클라이언트 | Google Cloud Console → 프로젝트 → Gmail API 사용 설정 → Google Auth Platform의 Branding/Audience/Data Access/Clients | Render 서비스 **Environment**의 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | 재시작 후 관리자 → Gmail 연결 | Google 계정 선택 화면 |
+| 연결할 Gmail 계정 승인 | 사이트의 Gmail 연결 → Google의 계정 선택·권한 승인 | 앱이 `/var/data/secrets/gmail-token.json`에 자동 저장 | 앱으로 돌아온 뒤 실제 요청으로 연결 검증 | 실제 계정 주소·Gmail 조회 성공 시각 |
 | 수집 라벨과 시작 시점 | Gmail에서 전용 라벨 생성; 사이트 관리자 → Gmail 연결·수집 범위 | 관리자 화면의 라벨·시작 시점 | 범위와 건수 먼저 확인 → 확인한 범위 적용 → 문의 확인 | 마지막 수신 성공 시각, 범위에 해당하는 상담 |
-| OpenAI 프로젝트 키·모델 ID | OpenAI Platform → 선택한 Project → API keys, 모델 접근 권한·Billing/Limits | `/etc/gapyear/service.env`의 `GAPYEAR_OPENAI_API_KEY`, `OPENAI_MODEL` | 재시작 후 실제 요청으로 연결 검증 | 실제 생성 성공, 모델·요청 ID·사용량 |
+| OpenAI 프로젝트 키·모델 ID | OpenAI Platform → 선택한 Project → API keys, 모델 접근 권한·Billing/Limits | Render 서비스 **Environment**의 `GAPYEAR_OPENAI_API_KEY`, `OPENAI_MODEL` | 재시작 후 실제 요청으로 연결 검증 | 실제 생성 성공, 모델·요청 ID·사용량 |
 | 확인용 수신 주소 | 관리자 → 운영·발송 설정 | 확인용 실제 수신 주소 | 연결 검증 단계 저장 | 지정 수신자에만 제한된 발송 가능 |
 | 선택적 보고용 Sheets | Google Cloud Sheets API, Google Sheets 문서 공유 | 서버의 `SHEETS_*` 비밀 설정·문서 ID | 연결 검증 → Sheets 보고 데이터 동기화 | 동기화 완료, 보고 시트 내용 |
 
-호스팅 업체가 결정되지 않았으므로 특정 업체의 생성 버튼이나 비용을 확정하지 않습니다.
-현재 준비된 구체적 배포 방식은 Linux VPS·systemd·Caddy이며 다른 호스팅을 고르면 해당 환경에
-맞게 영속 디스크와 상시 작업 구성을 검토해야 합니다. 무료 임시 미리보기를 운영 배포로 대체하지 않습니다.
+Render용 웹 서비스 1개·영속 디스크 1GB 구성을 준비했습니다. 현재 공식 요금은 네트워크 접근 제한으로 확인 대기이며, 가입·비용 승인·실제 생성은 하지 않았습니다. 서버가 상시 실행되고 SQLite가 영속 디스크에 보존되는지 실제 배포에서 확인해야 합니다. 무료 임시 미리보기를 운영 배포로 대체하지 않습니다.
 
 ## Gmail OAuth 설정
 
@@ -33,14 +29,14 @@ Secret 설정에서만 입력하고 채팅, 소스, 일반 로그, 브라우저 
 | `APP_BASE_URL` | 실제 배포된 HTTPS origin. 경로·쿼리를 붙이지 않습니다. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth **웹 애플리케이션** 클라이언트 설정. |
 | `GOOGLE_TOKEN_FILE` | 앱이 발급·갱신한 토큰을 저장하는 보호된 파일 경로. 직접 토큰을 붙여넣지 않습니다. |
-| `APP_SECRET_DIR` | 토큰 파일 경로를 생략했을 때 사용할 비밀 디렉터리. 배포 예시는 `/var/lib/gapyear-secrets`. |
+| `APP_SECRET_DIR` | 토큰 파일 경로를 생략했을 때 사용할 비밀 디렉터리. Render는 `/var/data/secrets`, 대안 VPS는 `/var/lib/gapyear-secrets`. |
 | `GMAIL_ALIASES` | 선택사항. 실제 연결 계정의 회사 발신 별칭을 쉼표로 구분합니다. |
 
 Google Auth Platform → Clients에서 승인된 리디렉션 URI에
 **관리자 화면의 ‘인증 복귀 주소’와 정확히 같은 값**을 등록합니다. 코드가 만드는 주소는
 `APP_BASE_URL` 뒤에 `/api/connections/gmail/callback`을 붙인 값입니다.
-아직 도메인이 없어서 지금 완성된 URL을 제시할 수 없습니다. HTTPS 주소가 확정되면
-서버 설정·관리자 화면·Google 설정 세 곳의 값이 일치해야 합니다.
+아직 Render 서비스를 생성하지 않아 완성된 URL은 없습니다. 별도 도메인 구매는 이 단계의 선행 조건이 아닙니다. 실제 HTTPS 주소가 확정되면
+서버 설정·관리자 화면·Google 설정 세 곳의 값이 일치해야 합니다. Google의 장기 운영 앱 검증에서 홈페이지·개인정보처리방침 도메인 소유 확인을 요구하면 별도 도메인을 준비해야 할 수 있으며, 이 요건은 Render HTTPS 제공과 구분합니다.
 
 요청 범위는 다음 두 가지뿐입니다.
 
@@ -130,7 +126,7 @@ Gmail에서 직접 보낸 답장은 해당 상담의 이전 예약을 취소합�
    현재 상태와 맞는 승인 문구로 확인용 예약 1건을 다시 지정하고 실제 시각에 자동 발송되는지 확인합니다.
    영업시간·필수 치환값·연락 조건을 유지하고, S6이면 최신 미완료 확인과 건별 승인이 필요합니다.
 8. 관리자 화면의 실제 수신·GPT 생성·직원 발송·답장 및 취소·예약 발송 증거를 검토합니다.
-   필요한 증거가 없으면 실제 운영 전환이 차단됩니다. 확인 후 **실제 운영**을 선택하고 설정을 저장합니다.
+   필요한 증거가 없으면 제한 운영 전환이 차단됩니다. 확인 후 **제한 운영 · 지정한 상담 최대 5건**을 선택하고 설정을 저장합니다. 관리자가 실제 상담 3~5건을 하나씩 등록하며 자동 후속은 각 상담에서 따로 허용합니다. 기존 상담 전체에 일괄 적용하지 않습니다.
 
 확인용 상담은 운영 전환 뒤 일반 고객 대상으로 승격하지 않습니다. 모의 데이터도 실제 발송
 대상으로 바꿀 수 없습니다. 오래된 운영 예약은 일괄 실행하지 않고 개별 직원 검토로 남깁니다.

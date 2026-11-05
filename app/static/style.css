@@ -24,5 +24,20 @@
 .operation-card{display:flex;flex-direction:column;align-items:flex-start;gap:9px;padding:19px;background:white;border:1px solid var(--line);border-radius:var(--radius)}
 .operation-card strong{font-size:12px}.operation-card small{overflow-wrap:anywhere}
 [hidden]{display:none!important}
+.contact-facts{display:flex;flex-direction:column;gap:3px;margin-bottom:14px;overflow-wrap:anywhere}
+.contact-facts span{font-size:12px;color:var(--muted)}
+.consent-summary{font-size:11px;overflow-wrap:anywhere;margin:-5px 0 8px}
+.compact-details{padding:12px 0;border-top:1px solid var(--line);margin:10px 0}
+.compact-details>summary{font-size:12px;margin-bottom:0}
+.compact-details[open]>summary{margin-bottom:15px}
+.required-conditions{padding-top:14px;margin-top:14px;border-top:1px solid var(--line)}
+.next-contact-summary{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:6px 0 16px}
+.next-contact-summary>div{display:flex;flex-direction:column;gap:5px}
+.next-contact-summary strong{font-size:17px;font-weight:600}
+.next-task{font-size:12px;line-height:1.8}.next-task strong{color:var(--teal);margin-right:8px}
+.followup-blockers{margin:12px 0}.followup-blockers ul{margin:6px 0 0;padding-left:18px}
+.schedule-details{margin-bottom:0;padding-bottom:0}.schedule-details .empty{padding:20px}
+.generation-details{margin-bottom:12px}.generation-details[open]>summary{margin-bottom:8px}
+.admin-extras>summary{font-size:12px}.admin-extras[open]>summary{border-bottom:1px solid var(--line)}
 @media(max-width:1100px){.operation-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:720px){.operation-grid{gap:10px}.operation-card{padding:14px}.latest-inquiry .definition{grid-template-columns:65px 1fr}.latest-inquiry .message-body{font-size:13px}.consultation-flow .card-header{align-items:flex-start;flex-wrap:wrap}}

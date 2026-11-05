@@ -172,7 +172,7 @@ class Service:
     def _migrate(self,c):
         # Additive migrations preserve all text, versions, approvals and histories.
         columns={
-            'cases':{'data_mode':"TEXT NOT NULL DEFAULT 'mock'",'mailbox_email':"TEXT NOT NULL DEFAULT ''",'purpose':"TEXT NOT NULL DEFAULT 'operational'",'company_owes_info':'INTEGER NOT NULL DEFAULT 0'},
+            'cases':{'data_mode':"TEXT NOT NULL DEFAULT 'mock'",'mailbox_email':"TEXT NOT NULL DEFAULT ''",'purpose':"TEXT NOT NULL DEFAULT 'operational'",'company_owes_info':'INTEGER NOT NULL DEFAULT 0','pilot_enrolled':'INTEGER NOT NULL DEFAULT 0','pilot_followups_enabled':'INTEGER NOT NULL DEFAULT 0','pilot_enrolled_at':'TEXT','pilot_enrolled_by':'TEXT','pilot_recipient':"TEXT NOT NULL DEFAULT ''"},
             'drafts':{'edit_version':'INTEGER NOT NULL DEFAULT 1','generation_metadata':"TEXT NOT NULL DEFAULT '{}'",'data_mode':"TEXT NOT NULL DEFAULT 'mock'",'supersedes_id':'TEXT'},
             'cycles':{'data_mode':"TEXT NOT NULL DEFAULT 'mock'",'purpose':"TEXT NOT NULL DEFAULT 'operational'"},
             'jobs':{'data_mode':"TEXT NOT NULL DEFAULT 'mock'",'purpose':"TEXT NOT NULL DEFAULT 'operational'",'activation_review_required':'INTEGER NOT NULL DEFAULT 0'},
@@ -249,7 +249,7 @@ class Service:
         if not values['weekdays'] or any(type(x) is not int or x not in range(7) for x in values['weekdays']):
             raise ValueError('발송 가능 요일을 선택하세요.')
         if any(type(values[k]) is not bool for k in ('live_enabled','legal_review_confirmed','connectivity_verified','auto_followups_paused')):raise ValueError('설정 확인 값은 true 또는 false여야 합니다.')
-        if values['operation_mode'] not in ('verification','production'):raise ValueError('운영 모드를 확인하세요.')
+        if values['operation_mode'] not in ('verification','limited','production'):raise ValueError('운영 모드를 확인하세요.')
         recipient=str(values['verification_recipient']).strip().lower()
         if recipient and not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+',recipient):raise ValueError('확인용 수신 주소를 확인하세요.')
         values['verification_recipient']=recipient
@@ -257,14 +257,17 @@ class Service:
         if type(values['retention_days']) is not int or values['retention_days']<1: raise ValueError('보관 기간은 1일 이상입니다.')
         if values['live_enabled'] and not (values['legal_review_confirmed'] and values['connectivity_verified']):
             raise ValueError('실제 발송 전 연결 검증과 적법한 연락 조건의 관리자 확인이 필요합니다.')
-        if self._data_mode()=='live' and values['operation_mode']=='production' and (original_settings['operation_mode']!='production' or (values['live_enabled'] and not original_settings['live_enabled'])):
+        if self._data_mode()=='live' and values['operation_mode'] in ('limited','production') and (original_settings['operation_mode']!=values['operation_mode'] or (values['live_enabled'] and not original_settings['live_enabled'])):
             status=self.activation_status(values)
             if not status['ready']:raise ValueError('실제 운영 활성화 전 제한된 연결 검증이 필요합니다: '+', '.join(status['missing']))
         with self.transaction() as c:
             previous={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM app_settings')}
             if previous.get('verification_recipient')!=values['verification_recipient']:
                 c.execute("DELETE FROM operations WHERE name LIKE 'verification_%'")
-            if (not previous.get('live_enabled') and values['live_enabled']) or (previous.get('operation_mode')!='production' and values['operation_mode']=='production') or (previous.get('auto_followups_paused') and not values['auto_followups_paused']):
+            if previous.get('operation_mode')!='limited' and values['operation_mode']=='limited':
+                c.execute("UPDATE cases SET pilot_enrolled=0,pilot_followups_enabled=0 WHERE data_mode='live'")
+                c.execute("UPDATE jobs SET status='staff_check',reason='제한 운영 시작: 관리자가 상담별 등록·후속 허용을 확인해야 합니다.',updated_at=? WHERE data_mode='live' AND purpose='operational' AND status IN ('pending','staff_check')",(iso(self.now()),))
+            if (not previous.get('live_enabled') and values['live_enabled']) or (previous.get('operation_mode')!=values['operation_mode'] and values['operation_mode'] in ('limited','production')) or (previous.get('auto_followups_paused') and not values['auto_followups_paused']):
                 c.execute("UPDATE jobs SET activation_review_required=1,status='staff_check',reason='운영 활성화 이전의 경과 예약: 직원 개별 검토 필요',updated_at=? WHERE data_mode='live' AND purpose='operational' AND status IN ('pending','staff_check') AND due_at<=?",(iso(self.now()),iso(self.now())))
             for k,v in values.items(): c.execute('UPDATE app_settings SET value=? WHERE key=?',(json.dumps(v),k))
             self._audit(c,actor,'settings.updated',details=data)
@@ -334,7 +337,7 @@ class Service:
 
     def _decode_case(self,r):
         r['fields']=json.loads(r.get('fields','{}'))
-        for key in ('email_allowed','opt_out','company_owes_info'):
+        for key in ('email_allowed','opt_out','company_owes_info','pilot_enrolled','pilot_followups_enabled'):
             if key in r:r[key]=bool(r[key])
         return r
 
@@ -351,6 +354,9 @@ class Service:
             result['latest_inquiry']=next((m for m in reversed(result['history']) if m['direction']=='inbound'),None)
             result['approval_context']={k:result[k] for k in ('email','subject','generation','state_revision')}
             result['next_due']=min((j['due_at'] for j in result['jobs'] if j['status'] in ('pending','staff_check')),default=None)
+            latest=result['latest_inquiry']
+            result['latest_reception_latency_seconds']=max(0,(dt(latest['created_at'])-dt(latest['received_at'])).total_seconds()) if latest and latest['source']=='gmail' else None
+            result['operational_status']=self._operational_status(c,result)
             return result
 
     def _customer(self,c,email,name,phone=None):
@@ -405,7 +411,7 @@ class Service:
         c.execute("UPDATE drafts SET status='stale',edit_version=edit_version+1,updated_at=? WHERE case_id=? AND status='draft'",(now,case_id))
         # Ordinary replies affect the matched account/thread consultation only.
         # Contact refusal and uncertain transmission remain customer-wide gates.
-        c.execute('UPDATE cases SET selected_generation=-1,updated_at=? WHERE id=?',(now,case_id))
+        c.execute('UPDATE cases SET selected_generation=-1,pilot_followups_enabled=0,updated_at=? WHERE id=?',(now,case_id))
         if direction=='inbound':
             c.execute("UPDATE cases SET generation=generation+1,last_inbound_at=?,workflow='state_selection',updated_at=? WHERE id=?",(received,now,case_id))
             body=m.get('body') or ''
@@ -432,13 +438,22 @@ class Service:
                 self._record_operation(c,'gmail_poll',False,error='Gmail 연결 오류: '+type(exc).__name__)
                 self._audit(c,'scheduler','gmail.poll_failed',details={'type':type(exc).__name__})
             return {'ok':False,'count':0,'error':'Gmail 연결 오류: 새 답장 확인 불가'}
-        ids=[]
+        ids=[];latencies=[];new_messages=0;duplicates=0
         with self.transaction() as c:
             for m in sorted(messages,key=lambda x:x.get('received_at','')):
+                pid=m.get('id') or m.get('provider_id')
+                existed=c.execute('SELECT 1 FROM messages WHERE provider_id=?',(pid,)).fetchone()
                 result=self._ingest(c,m)
                 if result:ids.append(result)
-        self.record_operation('gmail_poll',True,{'count':len(ids)})
-        return {'ok':True,'count':len(ids),'case_ids':list(dict.fromkeys(ids))}
+                if existed:duplicates+=1
+                elif result:
+                    registered=c.execute('SELECT direction,source,received_at,created_at FROM messages WHERE provider_id=?',(pid,)).fetchone()
+                    if registered:
+                        new_messages+=1
+                        if registered['direction']=='inbound' and registered['source']=='gmail':latencies.append(max(0,(dt(registered['created_at'])-dt(registered['received_at'])).total_seconds()))
+            metrics={'count':len(ids),'new_messages':new_messages,'duplicate_messages':duplicates,'last_reception_latency_seconds':latencies[-1] if latencies else None,'max_reception_latency_seconds':max(latencies) if latencies else None}
+            self._record_operation(c,'gmail_poll',True,metrics)
+        return {'ok':True,**metrics,'case_ids':list(dict.fromkeys(ids))}
 
     def create_phone(self,data,actor):
         if not (data.get('body') or '').strip():raise ValueError('전화 상담 내용을 입력하세요.')
@@ -485,7 +500,7 @@ class Service:
                 return self.get_case(case_id)
             self._cancel(c,case['customer_id'],'직원 고객 상태 변경' if state!=case['state'] else '새 문의 상태 확인',case_id)
             now=iso(self.now());revision=case['state_revision']+1
-            c.execute("UPDATE cases SET state=?,state_revision=?,selected_generation=generation,workflow='consulting',updated_at=? WHERE id=?",(state,revision,now,case_id))
+            c.execute("UPDATE cases SET state=?,state_revision=?,selected_generation=generation,pilot_followups_enabled=0,workflow='consulting',updated_at=? WHERE id=?",(state,revision,now,case_id))
             c.execute("UPDATE drafts SET status='stale',edit_version=edit_version+1,updated_at=? WHERE case_id=? AND status='draft'",(now,case_id))
             c.execute('INSERT INTO state_history VALUES (?,?,?,?,?,?)',(uid(),case_id,state,actor,now,revision))
             self._audit(c,actor,'state.selected',case_id,{'state':state,'revision':revision})
@@ -540,6 +555,20 @@ class Service:
         r['generation_metadata']=json.loads(r.get('generation_metadata','{}'))
         return r
 
+    def _draft_scope_reason(self,case):
+        if getattr(self.drafter,'is_mock',False):return None
+        mode=self.settings()['operation_mode']
+        if mode not in ('verification','limited'):return None
+        if case['data_mode']!='live' or case['mailbox_email']!=self._mailbox_email() or not self._mailbox_email():
+            return '실제 OpenAI에는 현재 연결된 Gmail 계정의 확인용·제한 운영 상담만 전달할 수 있습니다.'
+        if mode=='verification':
+            recipient=self.settings()['verification_recipient']
+            if case['purpose']!='verification' or not recipient or case['email']!=recipient:
+                return '실제 OpenAI 답변 생성 전 관리자가 지정한 수신자의 확인용 상담으로 등록하세요.'
+        elif case['purpose']!='operational' or not case['pilot_enrolled'] or case['email']!=case['pilot_recipient']:
+            return '실제 OpenAI 답변 생성 전 관리자가 이 상담과 현재 수신자를 제한 운영 대상으로 개별 등록해야 합니다.'
+        return None
+
     def generate_draft(self,case_id,actor,regenerate=False,expected_version=None):
         with self.transaction() as c:
             case=self._case(c,case_id)
@@ -548,7 +577,12 @@ class Service:
             if previous and not regenerate:return self._decode_draft(dict(previous))
             if previous and regenerate and expected_version!=previous['edit_version']:raise DraftConflict('재생성 전에 최신 직원 수정본을 확인하세요.')
             if not previous and regenerate and expected_version is not None:raise DraftConflict('초안이 변경되었습니다. 최신 상담 화면을 확인하세요.')
-            history=[dict(r) for r in c.execute('SELECT direction,body,subject,received_at,source FROM messages WHERE case_id IN (SELECT id FROM cases WHERE customer_id=? AND data_mode=? AND mailbox_email=?) ORDER BY received_at DESC LIMIT 30',(case['customer_id'],case['data_mode'],case['mailbox_email']))][::-1]
+            scope_reason=self._draft_scope_reason(case)
+            if scope_reason:raise ValueError(scope_reason)
+            if not getattr(self.drafter,'is_mock',False) and self.settings()['operation_mode'] in ('verification','limited'):
+                history=[dict(r) for r in c.execute('SELECT direction,body,subject,received_at,source FROM messages WHERE case_id=? ORDER BY received_at DESC LIMIT 30',(case_id,))][::-1]
+            else:
+                history=[dict(r) for r in c.execute('SELECT direction,body,subject,received_at,source FROM messages WHERE case_id IN (SELECT id FROM cases WHERE customer_id=? AND data_mode=? AND mailbox_email=?) ORDER BY received_at DESC LIMIT 30',(case['customer_id'],case['data_mode'],case['mailbox_email']))][::-1]
             latest=c.execute("SELECT body FROM messages WHERE case_id=? AND direction='inbound' ORDER BY received_at DESC,created_at DESC LIMIT 1",(case_id,)).fetchone()
             context={'state':case['state'],'customer_name':case['name'],'subject':case['subject'],'history':history,
                      'latest_inquiry':latest['body'] if latest else '',
@@ -624,7 +658,7 @@ class Service:
             if reason:raise ValueError(reason)
             if case['company_owes_info']:raise ValueError('회사 확인 업무가 남아 있습니다.')
             if c.execute("SELECT 1 FROM jobs WHERE case_id=? AND purpose='verification' AND status NOT IN ('cancelled')",(case_id,)).fetchone():raise ValueError('확인용 후속 예약은 상담별 한 건만 허용됩니다.')
-            sent=c.execute("SELECT o.* FROM outbox o JOIN drafts d ON o.draft_id=d.id WHERE o.case_id=? AND o.status='sent' AND o.data_mode='live' AND d.revision=? AND d.generation=? ORDER BY o.sent_at DESC LIMIT 1",(case_id,case['state_revision'],case['generation'])).fetchone()
+            sent=c.execute("SELECT o.* FROM outbox o JOIN drafts d ON o.draft_id=d.id WHERE o.case_id=? AND o.status='sent' AND o.data_mode='live' AND o.recipient=? AND d.revision=? AND d.generation=? ORDER BY o.sent_at DESC LIMIT 1",(case_id,case['email'],case['state_revision'],case['generation'])).fetchone()
             if not sent:raise ValueError('최신 문의에 실제 직원 승인 답장이 정상 발송된 뒤 예약하세요.')
             template=c.execute('SELECT * FROM template_versions WHERE id=? ORDER BY version DESC LIMIT 1',(template_id,)).fetchone()
             if not template or template['state']!=case['state'] or template['approval']!='승인 완료':raise ValueError('현재 고객 상태에 맞는 관리자 승인 문구만 검증할 수 있습니다.')
@@ -634,6 +668,120 @@ class Service:
              VALUES(?,?,?,?,?,1,?,?,?,?,'live','verification')""",(job_id,case_id,cycle_id,template_id,template['version'],iso(target),iso(self._next_allowed(target)),now,now))
             self._audit(c,actor,'verification.followup_scheduled',job_id,{'template_id':template_id,'due_at':iso(target),'normal_schedule_unchanged':True})
             return dict(c.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone())
+
+    def pilot_status(self):
+        with self.connect() as c:
+            rows=[dict(r) for r in c.execute("SELECT ca.id,ca.pilot_enrolled_at,ca.pilot_enrolled_by,ca.pilot_followups_enabled,cu.name,cu.email FROM cases ca JOIN customers cu ON ca.customer_id=cu.id WHERE ca.pilot_enrolled=1 ORDER BY ca.pilot_enrolled_at")]
+        return {'maximum':5,'enrolled_count':len(rows),'cases':rows}
+
+    def enroll_pilot_case(self,case_id,actor,enabled=True):
+        if type(enabled) is not bool:raise ValueError('제한 운영 등록 여부는 true 또는 false여야 합니다.')
+        settings=self.settings()
+        if enabled:
+            if self._data_mode()!='live' or settings['operation_mode']!='limited':raise ValueError('실제 제한 운영 모드에서 상담을 개별 등록하세요.')
+            if not self.activation_status()['ready']:raise ValueError('현재 Gmail 계정의 실제 연결·발송·답장 취소 검증을 먼저 완료하세요.')
+        with self.transaction() as c:
+            case=self._case(c,case_id)
+            if enabled:
+                if case['data_mode']!='live' or case['purpose']!='operational' or case['mailbox_email']!=self._mailbox_email():raise ValueError('현재 연결된 계정의 실제 운영 상담만 등록할 수 있습니다.')
+                if not case['email']:raise ValueError('제한 운영 이메일 수신 주소가 필요합니다.')
+                if case['opt_out'] or case['workflow']=='closed' or case['payment'] in ('complete','stopped'):raise ValueError('연락 거부·종료·신청 완료 상담은 등록할 수 없습니다.')
+                count=c.execute('SELECT count(*) FROM cases WHERE pilot_enrolled=1 AND id!=?',(case_id,)).fetchone()[0]
+                if count>=5:raise ValueError('제한 운영 대상은 최대 5건입니다. 기존 대상을 해제한 뒤 등록하세요.')
+                if not case['pilot_enrolled'] or case['pilot_recipient']!=case['email']:
+                    c.execute('UPDATE cases SET pilot_enrolled=1,pilot_followups_enabled=0,pilot_recipient=?,pilot_enrolled_at=?,pilot_enrolled_by=? WHERE id=?',(case['email'],iso(self.now()),actor,case_id))
+                    c.execute("UPDATE jobs SET status='staff_check',reason='제한 운영 후속 연락 개별 활성화 필요',updated_at=? WHERE case_id=? AND status IN ('pending','staff_check')",(iso(self.now()),case_id))
+                    self._audit(c,actor,'pilot.enrolled',case_id)
+            else:
+                c.execute('UPDATE cases SET pilot_enrolled=0,pilot_followups_enabled=0 WHERE id=?',(case_id,))
+                c.execute("UPDATE jobs SET status='staff_check',reason='관리자가 제한 운영 등록을 해제했습니다.',updated_at=? WHERE case_id=? AND status IN ('pending','staff_check')",(iso(self.now()),case_id))
+                self._audit(c,actor,'pilot.removed',case_id)
+        return self.get_case(case_id)
+
+    def _template_readiness(self,c,case):
+        templates=[dict(r) for r in c.execute('SELECT t.* FROM template_versions t WHERE state=? AND version=(SELECT max(version) FROM template_versions x WHERE x.id=t.id) ORDER BY id',(case['state'],))]
+        fields=json.loads(case['fields']) if isinstance(case['fields'],str) else case['fields']
+        approved=[t for t in templates if t['approval']=='승인 완료']
+        eligible=[]
+        for template in approved:
+            needed=re.findall(r'\[([^\]]+)\]',template['body']+' '+template['conditions'])
+            if any(not str(fields.get(key,'')).strip() for key in needed):continue
+            if template['id']=='S3-01' and (not fields.get('A 프로젝트') or fields.get('A 프로젝트')==fields.get('B 프로젝트')):continue
+            eligible.append(template)
+        return templates,approved,eligible
+
+    def set_pilot_followups(self,case_id,enabled,actor):
+        if type(enabled) is not bool:raise ValueError('후속 연락 활성화 여부는 true 또는 false여야 합니다.')
+        settings=self.settings()
+        with self.transaction() as c:
+            case=self._case(c,case_id)
+            if not enabled:
+                c.execute('UPDATE cases SET pilot_followups_enabled=0 WHERE id=?',(case_id,))
+                c.execute("UPDATE jobs SET status='staff_check',reason='관리자가 이 상담의 제한 운영 후속 연락을 중지했습니다.',updated_at=? WHERE case_id=? AND status IN ('pending','staff_check')",(iso(self.now()),case_id))
+                self._audit(c,actor,'pilot.followups_paused',case_id)
+            else:
+                if self._data_mode()!='live' or settings['operation_mode']!='limited' or not case['pilot_enrolled']:raise ValueError('먼저 실제 제한 운영 대상으로 등록하세요.')
+                reason=self._contact_reason(case)
+                if reason:raise ValueError(reason)
+                if case['company_owes_info']:raise ValueError('회사가 운영정보를 확인해 답변해야 하는 상담입니다.')
+                if c.execute("SELECT 1 FROM outbox WHERE case_id IN (SELECT id FROM cases WHERE customer_id=?) AND status IN ('sending','uncertain')",(case['customer_id'],)).fetchone():raise ValueError('이 고객의 불명확한 발송 기록을 먼저 확인하세요.')
+                templates,approved,eligible=self._template_readiness(c,case)
+                if not eligible:raise ValueError('현재 상태에 맞는 승인 문구와 필요한 치환정보를 한 건 이상 확인하세요. 미승인 문구는 자동 승인되지 않습니다.')
+                sent=c.execute("SELECT o.* FROM outbox o JOIN drafts d ON o.draft_id=d.id WHERE o.case_id=? AND o.status='sent' AND o.data_mode='live' AND o.recipient=? AND d.revision=? AND d.generation=? ORDER BY o.sent_at DESC LIMIT 1",(case_id,case['email'],case['state_revision'],case['generation'])).fetchone()
+                if not sent:raise ValueError('최신 문의에 대한 직원 승인 답장이 실제 정상 발송된 뒤 후속 연락을 활성화하세요.')
+                cycle=c.execute('SELECT * FROM cycles WHERE case_id=? AND active=1 AND state=? AND revision=? AND generation=? AND base_sent_at=?',(case_id,case['state'],case['state_revision'],case['generation'],sent['sent_at'])).fetchone()
+                if not cycle:
+                    self._cancel(c,case['customer_id'],'제한 운영의 현재 답장 기준 후속 시작',case_id)
+                    self._create_cycle(c,case,dt(sent['sent_at']))
+                was_enabled=bool(case['pilot_followups_enabled'])
+                c.execute("UPDATE cases SET pilot_followups_enabled=1,followup_mode='active' WHERE id=?",(case_id,))
+                if not was_enabled:
+                    c.execute("UPDATE jobs SET activation_review_required=1,status='staff_check',reason='개별 활성화 이전의 경과 예약: 직원 개별 검토 필요',updated_at=? WHERE case_id=? AND status IN ('pending','staff_check') AND due_at<=?",(iso(self.now()),case_id,iso(self.now())))
+                self._audit(c,actor,'pilot.followups_enabled',case_id,{'approved_templates':len(approved),'total_templates':len(templates),'base_sent_at':sent['sent_at']})
+        return self.get_case(case_id)
+
+    def hold_overdue_after_restart(self,actor='startup'):
+        with self.transaction() as c:
+            rows=[dict(r) for r in c.execute("SELECT id,case_id,due_at FROM jobs WHERE data_mode='live' AND status IN ('pending','staff_check') AND due_at<=?",(iso(self.now()),))]
+            if rows:
+                c.execute("UPDATE jobs SET activation_review_required=1,status='staff_check',reason='서버 중단·재시작 중 경과 예약: 직원 개별 검토 필요',updated_at=? WHERE data_mode='live' AND status IN ('pending','staff_check') AND due_at<=?",(iso(self.now()),iso(self.now())))
+            self._record_operation(c,'scheduler_startup',True,{'held_jobs':len(rows)})
+            if rows:self._audit(c,actor,'scheduler.restart_overdue_held',details={'job_count':len(rows)})
+        return {'held_count':len(rows),'jobs':rows}
+
+    def _operational_status(self,c,case):
+        settings=self.settings()
+        contact=self._contact_reason(case)
+        generation_reason=self._draft_scope_reason(case)
+        if case['data_mode']!=self._data_mode():generation_reason='모의 상담은 실제 모드로 전환할 수 없습니다. 별도 운영 상담을 사용하세요.'
+        if not case['state'] or case['selected_generation']!=case['generation']:generation_reason='최신 고객 문의를 확인하고 S0~S6 상태를 먼저 저장하세요.'
+        unresolved=c.execute("SELECT 1 FROM outbox WHERE case_id IN (SELECT id FROM cases WHERE customer_id=?) AND status IN ('sending','uncertain')",(case['customer_id'],)).fetchone()
+        draft=next((d for d in case.get('drafts',[]) if d['status']=='draft' and d['revision']==case['state_revision'] and d['generation']==case['generation']),None)
+        templates,approved,eligible=self._template_readiness(c,case)
+        manual=[contact] if contact else []
+        if unresolved:manual.append('이 고객의 이전 발송 결과가 불명확합니다. Gmail 전송 기록을 확인하세요.')
+        followup=list(manual)
+        limited=case['data_mode']=='live' and settings['operation_mode']=='limited'
+        if case['company_owes_info']:followup.append('회사가 운영정보를 확인해 답변해야 합니다.')
+        if settings['auto_followups_paused']:followup.append('관리자가 전체 자동 후속 발송을 중지했습니다.')
+        if case['followup_mode']!='active':followup.append('이 상담의 후속 연락이 보류 또는 중단 상태입니다.')
+        if limited and not case['pilot_followups_enabled']:followup.append('이 상담의 후속 연락을 개별 활성화해야 합니다.')
+        if case['state'] and not eligible:followup.append('현재 상태의 승인 문구 또는 필수 치환정보를 확인해야 합니다.')
+        held=[j for j in case.get('jobs',[]) if j['status'] in ('pending','staff_check') and j['activation_review_required']]
+        if held:followup.append('경과 예약은 직원의 개별 검토·승인이 필요합니다.')
+        if case['state']=='S6':followup.append('S6은 최신 신청·결제 상태 확인과 건별 직원 승인이 필요합니다.')
+        if case['workflow']=='closed':action='종료된 상담의 이력을 확인하세요.'
+        elif case['opt_out']:action='연락 거부 상태를 유지하고 필요한 내부 확인만 진행하세요.'
+        elif unresolved:action='불명확한 발송을 Gmail 전송 기록과 대조하세요.'
+        elif case['company_owes_info']:action='회사 운영정보를 확인한 뒤 고객에게 답변하세요.'
+        elif case['selected_generation']!=case['generation'] or not case['state']:action='최신 문의를 읽고 고객 상태를 저장하세요.'
+        elif limited and not case['pilot_enrolled']:action='관리자가 이 상담을 제한 운영 대상으로 개별 등록하세요.'
+        elif draft:action='저장된 초안을 검토하고 수신자·본문을 확인한 뒤 발송하세요.'
+        elif limited and not case['pilot_followups_enabled'] and case['workflow']=='waiting_reply':action='연락 조건과 승인 문구를 확인한 뒤 이 상담의 후속 연락을 개별 활성화하세요.'
+        elif held:action='중단 중 경과한 예약을 각각 검토해 발송 여부를 결정하세요.'
+        elif case.get('next_due'):action='다음 후속 예정 시점까지 고객 답장을 확인하세요.'
+        else:action='직원이 선택한 상태를 바탕으로 답변 초안을 생성하세요.'
+        return {'blockers':list(dict.fromkeys(manual+followup)),'next_action':action,'generation_blocked':bool(generation_reason),'generation_block_reason':generation_reason,'manual_send_blocked':bool(manual) or draft is None,'followup_blocked':bool(followup),'pilot_enrolled':bool(case['pilot_enrolled']),'pilot_followups_enabled':bool(case['pilot_followups_enabled']),'approved_template_count':len(approved),'eligible_template_count':len(eligible),'total_template_count':len(templates),'held_job_count':len(held)}
 
     def list_templates(self):
         with self.connect() as c:
@@ -664,6 +812,8 @@ class Service:
             if not r:raise ValueError('문구를 찾을 수 없습니다.')
             approval='승인 완료' if approved else '승인 취소'
             c.execute('UPDATE template_versions SET approval=?,approved_by=?,approved_at=? WHERE id=? AND version=?',(approval,actor,iso(self.now()),template_id,r['version']))
+            if approved and r['approval']!='승인 완료':
+                c.execute("UPDATE jobs SET activation_review_required=1,status='staff_check',reason='문구 승인 전에 경과한 예약: 직원 개별 검토 필요',updated_at=? WHERE template_id=? AND template_version=? AND data_mode='live' AND status IN ('pending','staff_check') AND due_at<=?",(iso(self.now()),template_id,r['version'],iso(self.now())))
             if not approved:
                 c.execute("UPDATE template_versions SET approval='승인 취소' WHERE id=?",(template_id,))
                 c.execute("UPDATE jobs SET status='staff_check',reason='문구 승인 취소',updated_at=? WHERE template_id=? AND status IN ('pending','staff_check')",(iso(self.now()),template_id))
@@ -680,6 +830,9 @@ class Service:
             if settings['operation_mode']=='verification':
                 if case['purpose']!='verification' or not settings['verification_recipient'] or case['email']!=settings['verification_recipient']:return '제한된 실제 확인 모드입니다. 지정한 확인용 상담·수신자만 발송할 수 있습니다.'
             elif case['purpose']=='verification':return '확인용 상담은 운영 발송 대상으로 전환되지 않습니다.'
+            elif settings['operation_mode']=='limited':
+                if not case['pilot_enrolled']:return '관리자가 이 상담을 최대 5건의 제한 운영 대상으로 개별 등록해야 합니다.'
+                if case['email']!=case['pilot_recipient']:return '제한 운영 등록 이후 수신자가 변경되었습니다. 관리자의 재등록이 필요합니다.'
         if not case['email']: return '이메일 주소가 없습니다.'
         if case['opt_out']: return '고객이 연락을 거부했습니다.'
         if not case['email_allowed'] or not case['consent_note'].strip(): return '직원이 이메일 연락 허용 및 근거를 확인해야 합니다.'
@@ -695,6 +848,7 @@ class Service:
         if dt(job['due_at'])>self.now(): return '예약 시점이 아직 도래하지 않았습니다.'
         if self._next_allowed(self.now())>self.now(): return '영업시간 외입니다.'
         if not manual and self.settings()['auto_followups_paused']:return '관리자가 전체 자동 후속 발송을 중지했습니다.'
+        if case['data_mode']=='live' and self.settings()['operation_mode']=='limited' and not case['pilot_followups_enabled']:return '이 상담의 제한 운영 후속 연락을 관리자가 개별 활성화해야 합니다.'
         if case['company_owes_info']:return '회사가 운영정보를 확인해 답변해야 합니다. 직원 확인 업무입니다.'
         if job['data_mode']!=self._data_mode():return '모의 예약은 실제 발송 대상으로 전환되지 않습니다.'
         if job['activation_review_required'] and not manual:return '운영 활성화 이전의 경과 예약: 직원 개별 검토 필요'
@@ -850,7 +1004,9 @@ class Service:
             if fresh:
                 c.execute('UPDATE cases SET workflow=?,updated_at=? WHERE id=?',('staff_check' if case['company_owes_info'] else 'waiting_reply',now,case['id']))
                 self._cancel(c,case['customer_id'],'새 직원 승인 답변으로 관리 주기 교체',case['id'])
-                if case['followup_mode']=='active' and not case['company_owes_info'] and case['purpose']!='verification' and not self._contact_reason(case):
+                limited=(case['data_mode']=='live' and self.settings()['operation_mode']=='limited')
+                if limited:c.execute('UPDATE cases SET pilot_followups_enabled=0 WHERE id=?',(case['id'],))
+                if not limited and case['followup_mode']=='active' and not case['company_owes_info'] and case['purpose']!='verification' and not self._contact_reason(case):
                     self._create_cycle(c,case,sent_time)
         else:
             c.execute("UPDATE jobs SET status='sent',sent_at=?,reason='',updated_at=? WHERE id=?",(now,now,out['job_id']))

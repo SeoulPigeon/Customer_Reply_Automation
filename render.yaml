@@ -1,0 +1,53 @@
+# Review the paid web-service and persistent-disk prices in Render before applying.
+# This file defines resources; it does not create an account or deploy by itself.
+services:
+  - type: web
+    name: koreagapyear-staff
+    runtime: python
+    plan: starter
+    numInstances: 1
+    branch: review/staff-test-drive
+    autoDeploy: false
+    buildCommand: pip install -r requirements.lock
+    startCommand: python -m app.render_start
+    healthCheckPath: /health
+    disk:
+      name: gapyear-persistent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: APP_ENV
+        value: production
+      - key: APP_MAIL_MODE
+        value: live
+      - key: APP_AI_MODE
+        value: live
+      - key: ENABLE_SCHEDULER
+        value: "true"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: APP_DATA_DIR
+        value: /var/data/app
+      - key: APP_SECRET_DIR
+        value: /var/data/secrets
+      - key: GOOGLE_TOKEN_FILE
+        value: /var/data/secrets/gmail-token.json
+      - key: GAPYEAR_BACKUP_DIR
+        value: /var/data/backups
+      - key: GAPYEAR_BACKUP_INTERVAL_HOURS
+        value: "24"
+      - key: GAPYEAR_BACKUP_RETENTION_COUNT
+        value: "7"
+      - key: OPENAI_DAILY_REQUEST_LIMIT
+        value: "100"
+      - key: OPENAI_DAILY_TOKEN_LIMIT
+        value: "250000"
+      - key: OPENAI_USAGE_ALERT_PERCENT
+        value: "80"
+      - key: OPENAI_MAX_OUTPUT_TOKENS
+        value: "2048"
+# Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GAPYEAR_OPENAI_API_KEY and OPENAI_MODEL
+# later through the service's Environment settings. Do not commit their values.
+# APP_BASE_URL is derived at startup from Render's real RENDER_EXTERNAL_URL.

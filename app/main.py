@@ -124,6 +124,10 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
 
     @asynccontextmanager
     async def lifespan(app):
+        if production and enabled and not service.gmail.is_mock:
+            # A stopped server must not release elapsed live jobs on its first
+            # scheduler tick. Staff review preserves original dates and history.
+            await asyncio.to_thread(service.hold_overdue_after_restart)
         task = asyncio.create_task(loop()) if enabled else None
         yield
         if task:
@@ -421,11 +425,28 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
                 'telemetry': telemetry, 'sender': None if mail_mock else getattr(service.gmail, 'own_email', None),
                 'collection': collection, 'openai': usage, 'activation': service.activation_status(),
                 'operation_mode': config.get('operation_mode'), 'scheduler_enabled': enabled,
-                'automatic_followups_paused': config.get('auto_followups_paused', False)}
+                'automatic_followups_paused': config.get('auto_followups_paused', False),
+                'pilot': service.pilot_status()}
 
     @app.post('/api/operations/auto-followups/pause')
     def pause_automatic(user=Depends(admin)):
         return service.update_settings({'auto_followups_paused': True}, user['username'])
+
+    @app.post('/api/cases/{case_id}/pilot')
+    def pilot_enrollment(case_id: str, data: dict = Body(...), user=Depends(admin)):
+        if set(data) != {'enabled'} or type(data.get('enabled')) is not bool:
+            raise ValueError('개별 운영 등록 여부는 enabled: true/false로 지정하세요.')
+        if demo or service.gmail.is_mock:
+            raise ValueError('실제 Gmail 상담만 제한 운영 대상으로 등록할 수 있습니다.')
+        return service.enroll_pilot_case(case_id, user['username'], enabled=data['enabled'])
+
+    @app.post('/api/cases/{case_id}/pilot-followups')
+    def pilot_followups(case_id: str, data: dict = Body(...), user=Depends(admin)):
+        if set(data) != {'enabled'} or type(data.get('enabled')) is not bool:
+            raise ValueError('개별 자동 후속 허용 여부는 enabled: true/false로 지정하세요.')
+        if demo or service.gmail.is_mock:
+            raise ValueError('실제 제한 운영 상담의 후속만 개별 활성화할 수 있습니다.')
+        return service.set_pilot_followups(case_id, data['enabled'], user['username'])
 
     @app.post('/api/cases/{case_id}/verification')
     def verification_case(case_id: str, user=Depends(admin)):

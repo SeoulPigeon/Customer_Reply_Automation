@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
+import tempfile
 import time
 from typing import Any
 from urllib.parse import quote
@@ -30,6 +31,10 @@ import httpx
 
 class IntegrationError(RuntimeError):
     """A read/configuration failure. The caller must fail closed."""
+
+
+class ReauthenticationRequired(IntegrationError):
+    """Google grant expired or was revoked; an administrator must reconnect."""
 
 
 class SendUncertain(IntegrationError):
@@ -194,23 +199,61 @@ class MockGmail:
         return {"provider": "mock", "read_verified": True, "live_send_enabled": False}
 
 
+def google_token_path() -> Path | None:
+    value = os.getenv("GOOGLE_TOKEN_FILE")
+    if not value and os.getenv("APP_SECRET_DIR"):
+        value = str(Path(os.environ["APP_SECRET_DIR"]) / "gmail-token.json")
+    return Path(value).expanduser().resolve() if value else None
+
+
+def write_secret_json(path: Path, value: dict):
+    """Atomic private file, outside the application's HTTP-served directory."""
+    path = Path(path)
+    if not path.is_absolute() or path.is_symlink():
+        raise IntegrationError("Credential storage must be an absolute non-symlink path")
+    static = Path(__file__).resolve().parent / "static"
+    if path == static or static in path.parents:
+        raise IntegrationError("Credential storage cannot be inside the public static directory")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".oauth-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as stream:
+            os.chmod(temp, 0o600)
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
 class GoogleOAuth:
-    """Refresh access tokens in memory using explicit secure environment bindings."""
+    """Refresh access tokens without exposing tokens to SQLite, UI or errors."""
     def __init__(self, credentials: dict | None = None, client: httpx.Client | None = None,
                  prefix: str = "GOOGLE"):
         self.client = client or httpx.Client(timeout=30)
         self._lock = threading.Lock()
+        self.token_file = None
+        self.reconnect_required = False
         if credentials is None:
-            token_file = os.getenv(prefix + "_TOKEN_FILE")
+            token_file = google_token_path() if prefix == "GOOGLE" else os.getenv(prefix + "_TOKEN_FILE")
             credentials = {}
             if token_file:
-                try:
-                    credentials = json.loads(Path(token_file).read_text())
-                except (OSError, ValueError) as exc:
-                    raise IntegrationError("Google credential file could not be loaded") from exc
+                self.token_file = Path(token_file)
+                if self.token_file.exists():
+                    try:
+                        credentials = json.loads(self.token_file.read_text())
+                    except (OSError, ValueError) as exc:
+                        raise IntegrationError("Google credential file could not be loaded") from exc
+                    if not isinstance(credentials, dict):
+                        raise IntegrationError("Google credential file is invalid")
             for field in ("client_id", "client_secret", "refresh_token", "access_token"):
                 value = os.getenv(prefix + "_" + field.upper())
-                if value:
+                if value and (field in ("client_id", "client_secret") or not credentials.get("account_email")):
+                    # A completed interactive connection takes precedence over
+                    # obsolete bootstrap refresh/access token environment values.
                     credentials[field] = value
         self.credentials = dict(credentials)
         self._token = self.credentials.get("access_token")
@@ -223,13 +266,17 @@ class GoogleOAuth:
                 return self._token
             required = ("client_id", "client_secret", "refresh_token")
             if not all(self.credentials.get(k) for k in required):
-                raise IntegrationError("Google OAuth credentials are not configured")
+                raise IntegrationError("Google OAuth credentials are not configured; administrator connection required")
             try:
                 response = self.client.post("https://oauth2.googleapis.com/token", data={
                     "grant_type": "refresh_token", **{k: self.credentials[k] for k in required},
                 })
             except httpx.HTTPError as exc:
                 raise IntegrationError("Google OAuth refresh connection failed") from exc
+            if response.status_code in (400, 401):
+                self.reconnect_required = True
+                self._token = None
+                raise ReauthenticationRequired("Google OAuth authorization expired or was revoked; reconnect Gmail")
             result = _safe_response(response, "Google OAuth refresh")
             token = result.get("access_token")
             if not isinstance(token, str) or not token:
@@ -237,6 +284,13 @@ class GoogleOAuth:
             self._token = token
             self._expires_at = time.time() + float(result.get("expires_in", 3600))
             self.granted_scopes = result.get("scope", self.granted_scopes)
+            self.reconnect_required = False
+            if result.get("refresh_token"):
+                self.credentials["refresh_token"] = result["refresh_token"]
+            if self.token_file:
+                safe_file = {k: v for k, v in self.credentials.items() if k not in ("client_id", "client_secret")}
+                safe_file.update(access_token=token, expires_at=self._expires_at, scope=self.granted_scopes)
+                write_secret_json(self.token_file, safe_file)
             return token
 
     def headers(self) -> dict:
@@ -304,36 +358,153 @@ class GmailAPI:
 
     def __init__(self, credentials: dict | None = None, own_email: str | None = None,
                  allow_send: bool = False, client: httpx.Client | None = None,
-                 max_pages: int = 20):
+                 max_pages: int = 20, db_path: str | Path | None = None):
         self.client = client or httpx.Client(timeout=30)
         self.oauth = GoogleOAuth(credentials, self.client)
-        self.own_email = _address(own_email or os.getenv("GMAIL_ADDRESS", ""))
-        self.own_addresses = {self.own_email}
+        configured = own_email or self.oauth.credentials.get("account_email")
+        self.own_email = _address(configured) if configured else None
+        self.account_email = self.own_email
+        self.own_addresses = {self.own_email} if self.own_email else set()
         for alias in os.getenv("GMAIL_ALIASES", "").split(","):
             if alias.strip():
                 self.own_addresses.add(_address(alias))
         self.allow_send = allow_send
         self.max_pages = max_pages
+        self.db_path = str(db_path) if db_path else None
+        # Explicit injection is used by transport contract tests only. Runtime
+        # adapters must establish the account from Gmail's actual /profile.
+        self._profile_verified = False
+        self._collection = None
+        self.state_path = self.db_path + ".gmail-state.sqlite3" if self.db_path else None
+        if self.state_path:
+            Path(self.state_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with sqlite3.connect(self.state_path) as con:
+                con.execute("CREATE TABLE IF NOT EXISTS collection (account TEXT PRIMARY KEY,label TEXT NOT NULL,label_id TEXT NOT NULL,start_at TEXT NOT NULL)")
+            os.chmod(self.state_path, 0o600)
 
     def _get(self, suffix: str, params: dict | None = None) -> dict:
         try:
             response = self.client.get(self.BASE + suffix, params=params, headers=self.oauth.headers())
         except httpx.HTTPError as exc:
             raise IntegrationError("Gmail read connection failed") from exc
+        if response.status_code == 401:
+            self.oauth.reconnect_required = True
+            raise ReauthenticationRequired("Gmail read failed (HTTP 401); administrator reconnection required")
         return _safe_response(response, "Gmail read")
 
     def verify(self) -> dict:
         profile = self._get("/profile")
-        if _address(profile.get("emailAddress", "")) != self.own_email:
-            raise IntegrationError("Gmail profile does not match configured sender")
-        return {"provider": "gmail", "read_verified": True,
-                "send_verified": False, "live_send_enabled": bool(self.allow_send)}
+        actual = _address(profile.get("emailAddress", ""))
+        if self.own_email and actual != self.own_email:
+            self._profile_verified = False
+            raise IntegrationError("Gmail profile does not match the connected account; reconnect required")
+        self.own_email = self.account_email = actual
+        self.own_addresses.add(actual)
+        self._profile_verified = True
+        return {"provider": "gmail", "read_verified": True, "account_email": actual,
+                "send_verified": False, "live_send_enabled": bool(self.allow_send),
+                "reconnect_required": False, **self.collection_status()}
 
-    def _ids(self, query: str) -> list[str]:
+    def _ensure_profile(self):
+        if not self._profile_verified:
+            self.verify()
+
+    def _scope(self, value: str) -> str:
+        if not self.own_email:
+            raise IntegrationError("Gmail account is not verified")
+        return "gmail:" + hashlib.sha256(self.own_email.encode()).hexdigest()[:20] + ":" + str(value)
+
+    def _raw_id(self, value: str) -> str:
+        prefix = self._scope("")
+        if str(value).startswith(prefix):
+            return str(value)[len(prefix):]
+        # Never allow another mailbox's saved thread or legacy unscoped ID to
+        # address a live conversation after accounts change.
+        raise IntegrationError("Gmail thread belongs to another or unverified mailbox")
+
+    def collection_status(self) -> dict:
+        saved = self._collection
+        if self.state_path and self.own_email:
+            with sqlite3.connect(self.state_path) as con:
+                con.row_factory = sqlite3.Row
+                row = con.execute("SELECT label,label_id,start_at FROM collection WHERE account=?", (self.own_email,)).fetchone()
+                saved = dict(row) if row else None
+        return {"configured": bool(saved), "label": saved["label"] if saved else None,
+                "label_id": saved["label_id"] if saved else None,
+                "start_at": saved["start_at"] if saved else None,
+                "account_email": self.own_email, "reconnect_required": self.oauth.reconnect_required}
+
+    def _collection_values(self, label: str, start_at: str) -> dict:
+        self._ensure_profile()
+        if not isinstance(label, str) or not label.strip() or len(label) > 225:
+            raise IntegrationError("Select a non-empty Gmail label")
+        try:
+            start = _utc(start_at)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationError("Collection start must include a valid timezone") from exc
+        labels = self._get("/labels").get("labels", [])
+        match = next((x for x in labels if x.get("name") == label.strip()), None)
+        if not match or match.get("type") == "system":
+            raise IntegrationError("Create and select a dedicated customer-inquiry Gmail label")
+        return {"label": label.strip(), "label_id": match["id"], "start_at": start}
+
+    def preview_collection(self, label: str, start_at: str) -> dict:
+        values = self._collection_values(label, start_at)
+        count = len(self._ids(self._collection_query(values), label_id=values["label_id"]))
+        return {**values, "count": count, "account_email": self.own_email}
+
+    def configure_collection(self, label: str, start_at: str) -> dict:
+        values = self._collection_values(label, start_at)
+        if self.state_path:
+            with sqlite3.connect(self.state_path) as con:
+                con.execute("INSERT OR REPLACE INTO collection VALUES (?,?,?,?)", (self.own_email, values["label"], values["label_id"], values["start_at"]))
+        self._collection = values
+        return self.collection_status()
+
+    def _collection_query(self, values):
+        # Epoch seconds avoid Gmail's date-only Pacific-time interpretation.
+        start = int(datetime.fromisoformat(values["start_at"]).timestamp())
+        return f"after:{start} -in:spam -in:trash -in:drafts"
+
+    def _tracked_threads(self, customer_email=None) -> list[dict]:
+        if not self.db_path or not Path(self.db_path).exists():
+            return []
+        with sqlite3.connect(self.db_path) as con:
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute("""SELECT c.thread_id,u.email,MIN(m.received_at) AS start_at
+                    FROM cases c JOIN customers u ON u.id=c.customer_id
+                    JOIN messages m ON m.case_id=c.id WHERE c.thread_id LIKE ?
+                    GROUP BY c.thread_id,u.email""", (self._scope("") + "%",)).fetchall()
+            except sqlite3.OperationalError as exc:
+                raise IntegrationError("Registered Gmail conversations cannot be read") from exc
+        return [dict(r) for r in rows if not customer_email or r["email"] == customer_email]
+
+    def _thread_messages(self, row):
+        raw = self._get("/threads/" + quote(self._raw_id(row["thread_id"]), safe=""), {"format": "full"})
+        results = []
+        for item in raw.get("messages", []):
+            if "DRAFT" in item.get("labelIds", []):
+                continue
+            m = self._normalize(item, row["email"])
+            # No pre-registration history or unrelated participant is imported.
+            if m["received_at"] < row["start_at"] or m["email"] != row["email"]:
+                continue
+            if m["direction"] == "outbound":
+                h = {x["name"].lower(): x["value"] for x in item.get("payload", {}).get("headers", [])}
+                recipients = {e.lower() for _, e in getaddresses([h.get("to", ""), h.get("cc", "")])}
+                if row["email"] not in recipients:
+                    continue
+            results.append(m)
+        return results
+
+    def _ids(self, query: str, label_id: str | None = None) -> list[str]:
         ids: list[str] = []
         token = None
         for _ in range(self.max_pages):
             params = {"q": query, "maxResults": 500, "includeSpamTrash": True}
+            if label_id:
+                params["labelIds"] = label_id
             if token:
                 params["pageToken"] = token
             result = self._get("/messages", params)
@@ -361,13 +532,15 @@ class GmailAPI:
         )
         message_id = headers.get("message-id", "")
         return {
-            "id": raw["id"], "thread_id": raw["threadId"], "message_id": message_id,
+            "id": self._scope(raw["id"]), "thread_id": self._scope(raw["threadId"]), "message_id": message_id,
+            "account_email": self.own_email,
             "in_reply_to": headers.get("in-reply-to"), "references": headers.get("references", ""),
             "email": email, "name": "" if outbound else from_name,
             "subject": headers.get("subject", "(제목 없음)"), "body": _decode_body(payload),
             "received_at": _utc(int(raw.get("internalDate", "0")) / 1000),
             "direction": "outbound" if outbound else "inbound", "is_automated": bool(automated),
             "app_generated": bool(outbound and message_id.startswith("<gapyear-")),
+            "message_kind": ("bounce" if any(x in from_email for x in ("mailer-daemon", "postmaster")) or "report-type=delivery-status" in headers.get("content-type", "").lower() else "automated" if automated else "staff" if outbound else "customer"),
         }
 
     def _messages(self, query: str, customer_email: str | None = None) -> list[dict]:
@@ -380,22 +553,45 @@ class GmailAPI:
         return sorted(result, key=lambda m: (m["received_at"], m["id"]))
 
     def poll(self) -> list[dict]:
-        # Repeated polling deliberately overlaps; core deduplicates by Gmail ID.
-        # No cursor is advanced before the core has durably ingested a message.
-        return self._messages("newer_than:30d -in:spam -in:trash")
+        self._ensure_profile()
+        scope = self.collection_status()
+        if not scope["configured"]:
+            raise IntegrationError("Administrator must confirm a Gmail label and collection start first")
+        messages = {}
+        for mid in self._ids(self._collection_query(scope), label_id=scope["label_id"]):
+            raw = self._get("/messages/" + quote(mid, safe=""), {"format": "full"})
+            m = self._normalize(raw)
+            # Outgoing mail alone must not create unsolicited customer records.
+            if m["direction"] == "inbound" and m["email"] and not m["is_automated"] and m["received_at"] >= scope["start_at"]:
+                messages[m["id"]] = m
+        for row in self._tracked_threads():
+            for m in self._thread_messages(row):
+                messages[m["id"]] = m
+        return sorted(messages.values(), key=lambda m: (m["received_at"], m["id"]))
 
     def latest(self, customer_email: str) -> list[dict]:
         email = _address(customer_email)
-        # Quotes and syntax characters are not permitted as email query input.
         if re.search(r'["{}():\\]', email):
             raise IntegrationError("Email cannot safely be used for Gmail lookup")
-        return self._messages(f"in:anywhere {{from:{email} to:{email} cc:{email}}}", email)
+        self._ensure_profile()
+        messages = {}
+        # Only registered conversations, never a search across private mail.
+        for row in self._tracked_threads(email):
+            for m in self._thread_messages(row):
+                messages[m["id"]] = m
+        return sorted(messages.values(), key=lambda m: (m["received_at"], m["id"]))
 
     def send(self, to: str, subject: str, body: str, thread_id=None,
              in_reply_to=None, references=None, idempotency_key=None) -> dict:
         if not self.allow_send:
             raise IntegrationError("Live Gmail sending is disabled until administrator verification")
         recipient = _address(to)
+        if not isinstance(subject, str) or any(x in subject for x in "\r\n"):
+            raise IntegrationError("Invalid outbound mail headers")
+        for value in (in_reply_to, references):
+            if value and any(x in str(value) for x in "\r\n"):
+                raise IntegrationError("Invalid outbound mail headers")
+        self._ensure_profile()
         key = str(idempotency_key or uuid.uuid4())
         msg = EmailMessage()
         msg["To"] = recipient
@@ -415,7 +611,7 @@ class GmailAPI:
         msg.set_content(body)
         payload = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()}
         if thread_id:
-            payload["threadId"] = str(thread_id)
+            payload["threadId"] = self._raw_id(str(thread_id))
         headers = self.oauth.headers()  # refresh failure before any attempted send
         try:
             response = self.client.post(self.BASE + "/messages/send", json=payload, headers=headers)
@@ -425,10 +621,12 @@ class GmailAPI:
         except (httpx.HTTPError, IntegrationError) as exc:
             # Even a timeout or HTTP error could follow successful transmission.
             raise SendUncertain("Gmail send result is uncertain; check sent records before recovery") from exc
-        return {"id": result["id"], "thread_id": result["threadId"],
+        return {"id": self._scope(result["id"]), "thread_id": self._scope(result["threadId"]),
+                "account_email": self.own_email,
                 "message_id": str(msg["Message-ID"]), "received_at": _utc()}
 
     def reconcile(self, idempotency_key: str) -> dict | None:
+        self._ensure_profile()
         matches = self._messages("in:sent rfc822msgid:" + _message_id(idempotency_key))
         if len(matches) > 1:
             raise IntegrationError("Multiple matching sent messages require staff investigation")
@@ -469,55 +667,93 @@ class OpenAIDrafter:
     is_mock = False
 
     def __init__(self, api_key: str | None = None, model: str | None = None,
-                 client: httpx.Client | None = None):
+                 client: httpx.Client | None = None, db_path: str | Path | None = None):
+        from app.ai_usage import AIUsage
         self.api_key = api_key or os.getenv("GAPYEAR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
         self.model = model or os.getenv("OPENAI_MODEL")
         self.client = client or httpx.Client(timeout=45)
         self._verified_model = None
+        self.max_output_tokens = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2048"))
+        if not 256 <= self.max_output_tokens <= 16000:
+            raise IntegrationError("OPENAI_MAX_OUTPUT_TOKENS must be between 256 and 16000")
+        self.budget = AIUsage(str(db_path) + ".ai-usage.sqlite3" if db_path else None)
 
     def _headers(self):
         if not self.api_key or not self.model:
             raise IntegrationError("OpenAI API key and an accessible model must be configured")
         return {"Authorization": "Bearer " + self.api_key}
 
+    def usage_status(self):
+        return {"configured": bool(self.api_key and self.model), "model": self.model,
+                "max_output_tokens": self.max_output_tokens, **self.budget.status()}
+
+    def configure_usage_limits(self, values):
+        return self.budget.configure(values)
+
     def verify(self) -> dict:
-        try:
-            response = self.client.get("https://api.openai.com/v1/models/" + quote(self.model or "", safe=""),
-                                       headers=self._headers())
-        except httpx.HTTPError as exc:
-            raise IntegrationError("OpenAI model verification connection failed") from exc
-        result = _safe_response(response, "OpenAI model verification")
-        if result.get("id") != self.model:
-            raise IntegrationError("Configured OpenAI model is not available")
+        # This tests the actual generation endpoint/model without customer data.
+        result = self._request({"connection_check": "고객정보 없는 연결 확인입니다. body에는 연결 확인이라고만 쓰고 checks는 빈 배열로 작성하세요."})
         self._verified_model = self.model
-        return {"provider": "openai", "verified": True, "model": self.model}
+        return {"provider": "openai", "verified": True, "model": result["model"],
+                "request_id": result["request_id"], "generated_at": result["generated_at"],
+                "usage": result["usage"]}
 
     def generate(self, context: dict) -> dict:
-        if self._verified_model != self.model:
-            self.verify()
-        # No tools/functions are exposed to the model. The result is plain text data.
+        return self._request(context)
+
+    def _request(self, context: dict) -> dict:
+        headers = self._headers()
+        # Only the selected consultation context is accepted; tools, state
+        # changes, recipients and send approvals are never model capabilities.
+        context_text = json.dumps(context, ensure_ascii=False, default=str)
+        if len(context_text.encode()) > 120000:
+            raise IntegrationError("Consultation context is too large; reduce previous history before generation")
+        reserved_tokens = len((DRAFT_POLICY + context_text).encode()) + self.max_output_tokens + 100
+        try:
+            reservation = self.budget.reserve(reserved_tokens, self.model)
+        except ValueError as exc:
+            raise IntegrationError(str(exc)) from exc
         try:
             response = self.client.post("https://api.openai.com/v1/chat/completions",
-                headers=self._headers(), json={
+                headers=headers, json={
                     "model": self.model,
                     "messages": [{"role": "system", "content": DRAFT_POLICY},
-                                 {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)}],
+                                 {"role": "user", "content": context_text}],
                     "response_format": {"type": "json_object"},
+                    "max_completion_tokens": self.max_output_tokens,
+                    "store": False,
                 })
         except httpx.HTTPError as exc:
-            raise IntegrationError("OpenAI draft generation connection failed") from exc
-        result = _safe_response(response, "OpenAI draft generation")
+            self.budget.finish(reservation, status="error")
+            raise IntegrationError("OpenAI draft generation connection failed; no mock answer substituted") from exc
         try:
-            draft = json.loads(result["choices"][0]["message"]["content"])
+            result = _safe_response(response, "OpenAI draft generation")
+        except IntegrationError:
+            self.budget.finish(reservation, status="error")
+            raise
+        raw_usage = result.get("usage") or {}
+        usage = {k: raw_usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                 if type(raw_usage.get(k)) is int and raw_usage[k] >= 0}
+        request_id = response.headers.get("x-request-id") or result.get("id")
+        returned_model = result.get("model") or self.model
+        self.budget.finish(reservation, tokens=usage.get("total_tokens"), request_id=request_id, model=returned_model)
+        try:
+            choice = result["choices"][0]
+            if choice.get("finish_reason") in ("length", "content_filter"):
+                raise ValueError("incomplete generation")
+            draft = json.loads(choice["message"]["content"])
             body = draft["body"]
             checks = draft["checks"]
             if not isinstance(body, str) or not body.strip() or len(body) > 20000:
                 raise ValueError("invalid body")
-            if not isinstance(checks, list) or any(not isinstance(c, str) for c in checks):
+            if not isinstance(checks, list) or len(checks) > 50 or any(not isinstance(c, str) or len(c) > 2000 for c in checks):
                 raise ValueError("invalid checks")
         except (KeyError, IndexError, TypeError, ValueError) as exc:
+            self.budget.finish(reservation, tokens=usage.get("total_tokens"), request_id=request_id, model=returned_model, status="invalid_response")
             raise IntegrationError("OpenAI returned an invalid draft; staff review required") from exc
-        return {"body": body, "checks": checks, "provider": "openai", "model": self.model}
+        self._verified_model = self.model
+        return {"body": body, "checks": checks, "provider": "openai", "model": returned_model,
+                "generated_at": _utc(), "request_id": request_id, "usage": usage}
 
 
 class SheetsAPI:
@@ -588,16 +824,16 @@ def gmail_from_env(db_path: str | Path):
     if mode == "mock":
         return MockGmail(db_path)
     if mode == "live":
-        return GmailAPI()
+        return GmailAPI(db_path=db_path)
     raise IntegrationError("APP_MAIL_MODE must be mock or live")
 
 
-def drafter_from_env():
+def drafter_from_env(db_path: str | Path | None = None):
     mode = os.getenv("APP_AI_MODE", "mock")
     if mode == "mock":
         return MockDrafter()
     if mode == "live":
-        return OpenAIDrafter()
+        return OpenAIDrafter(db_path=db_path or Path(os.getenv("APP_DATA_DIR", str(Path(__file__).resolve().parents[1] / "var"))) / "app.sqlite3")
     raise IntegrationError("APP_AI_MODE must be mock or live")
 
 

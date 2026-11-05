@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Gapyear database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Seoul
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Korea Gapyear staff website, mailbox polling and follow-up scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gapyear
+Group=gapyear
+WorkingDirectory=/srv/gapyear
+EnvironmentFile=/etc/gapyear/service.env
+ExecStart=/srv/gapyear/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gapyear /var/lib/gapyear-secrets
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Private consistent SQLite backup for Gapyear
+
+[Service]
+Type=oneshot
+User=gapyear
+Group=gapyear
+WorkingDirectory=/srv/gapyear
+EnvironmentFile=/etc/gapyear/service.env
+ExecStart=/srv/gapyear/.venv/bin/python -m app.cli backup --directory /var/backups/gapyear
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gapyear /var/backups/gapyear

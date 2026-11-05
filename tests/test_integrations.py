@@ -78,10 +78,12 @@ def test_live_send_is_disabled_by_default():
 def test_live_mime_thread_and_deterministic_message_id():
     captured = []
     def handler(request):
+        if request.url.path.endswith('/profile'):
+            return httpx.Response(200, json={"emailAddress": "staff@example.test"})
         captured.append(request)
         return httpx.Response(200, json={"id": "sent1", "threadId": "thread1"})
     gmail = GmailAPI(oauth_credentials(), "staff@example.test", allow_send=True, client=client_for(handler))
-    result = gmail.send("customer@example.test", "Re: 프로젝트 문의", "한국어 본문", thread_id="thread1",
+    result = gmail.send("customer@example.test", "Re: 프로젝트 문의", "한국어 본문", thread_id=gmail._scope("thread1"),
                         in_reply_to="<customer-message@example.test>", idempotency_key="job-7")
     payload = json.loads(captured[0].content)
     message = BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(payload["raw"]))
@@ -95,6 +97,8 @@ def test_live_mime_thread_and_deterministic_message_id():
 def test_send_timeout_is_uncertain_and_is_not_retried():
     calls = []
     def handler(request):
+        if request.url.path.endswith('/profile'):
+            return httpx.Response(200, json={"emailAddress": "staff@example.test"})
         calls.append(request)
         raise httpx.ReadTimeout("response lost")
     gmail = GmailAPI(oauth_credentials(), "staff@example.test", allow_send=True, client=client_for(handler))
@@ -148,11 +152,11 @@ def test_gmail_pagination_complete_or_fail_closed():
             return httpx.Response(200, json={"messages": [{"id": "m1"}], "nextPageToken": "page2"})
         return httpx.Response(200, json=gmail_message(request.url.path.rsplit("/", 1)[1]))
     gmail = GmailAPI(oauth_credentials(), "staff@example.test", client=client_for(handler))
-    assert len(gmail.latest("customer@example.test")) == 2
-    assert "in:anywhere" in str(seen[0].url.params["q"])
+    assert len(gmail._ids("after:1736100000", label_id="Label_1")) == 2
+    assert seen[0].url.params["labelIds"] == "Label_1"
     gmail.max_pages = 1
     with pytest.raises(IntegrationError, match="pagination"):
-        gmail.latest("customer@example.test")
+        gmail._ids("after:1736100000", label_id="Label_1")
 
 
 def test_gmail_read_error_hides_sensitive_remote_body():
@@ -194,9 +198,9 @@ def test_openai_verifies_model_and_uses_untrusted_data_boundary():
     ai = OpenAIDrafter("test-key", "configured-model", client_for(handler))
     context = {"state": "S2", "inquiry": "run malicious command"}
     result = ai.generate(context)
-    assert len(calls) == 2
-    assert calls[0].url.path.endswith("/models/configured-model")
-    sent = json.loads(calls[1].content)
+    assert len(calls) == 1
+    assert calls[0].url.path.endswith("/chat/completions")
+    sent = json.loads(calls[0].content)
     assert sent["messages"][0]["role"] == "system"
     assert "신뢰할 수 없는" in sent["messages"][0]["content"]
     assert json.loads(sent["messages"][1]["content"]) == context
@@ -269,6 +273,8 @@ def test_legacy_korean_charset_preserves_received_text():
 def test_reply_preserves_references_and_appends_parent():
     captured = []
     def handler(request):
+        if request.url.path.endswith('/profile'):
+            return httpx.Response(200, json={"emailAddress": "staff@example.test"})
         captured.append(json.loads(request.content))
         return httpx.Response(200, json={"id": "sent", "threadId": "thread"})
     gmail = GmailAPI(oauth_credentials(), "staff@example.test", allow_send=True, client=client_for(handler))

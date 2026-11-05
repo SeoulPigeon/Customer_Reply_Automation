@@ -348,7 +348,7 @@ def test_i_unpolled_message_is_detected_immediately_before_sending(env, event):
     assert all(job["status"] == "cancelled" for job in jobs_for(service, case["id"]))
 
 
-def test_i_new_thread_reply_cancels_all_active_cases_for_same_customer(env):
+def test_i_new_thread_inquiry_preserves_other_consultation_schedule(env):
     service, gmail, clock, _ = env
     case = prepare(env)
     first_reply(env, case)
@@ -356,7 +356,7 @@ def test_i_new_thread_reply_cancels_all_active_cases_for_same_customer(env):
     another = service.ingest_message(inbound(gmail, clock, thread="new-topic"))
     assert another["id"] != case["id"]
     assert another["customer_id"] == case["customer_id"]
-    assert all(job["status"] == "cancelled" for job in jobs_for(service, case["id"]))
+    assert all(job["status"] == "pending" for job in jobs_for(service, case["id"]))
 
 
 def test_automated_messages_do_not_invalidate_customer_cycle(env):

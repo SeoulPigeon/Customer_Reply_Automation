@@ -1,0 +1,8 @@
+# GAPYEAR_DOMAIN must be the DNS name the operator owns and points to this server.
+# This file does not create a domain or publish the development environment.
+{$GAPYEAR_DOMAIN} {
+    encode zstd gzip
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy 127.0.0.1:8000
+    # No file_server and no access log: DB, backups, secrets, OAuth codes are not served.
+}

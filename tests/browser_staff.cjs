@@ -1,0 +1,143 @@
+// Optional real-browser regression. Run through scripts/check_staff_ui.py.
+const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+
+(async () => {
+  const browser = await chromium.launch({executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium', headless: true, args: ['--no-sandbox']});
+  const context = await browser.newContext({viewport:{width:1440,height:1000}});
+  const page = await context.newPage();
+  const errors=[];
+  page.on('pageerror', e=>errors.push(e.message));
+  const snapshots=process.env.GAPYEAR_BROWSER_ARTIFACTS;
+  const capture=async name=>snapshots && page.screenshot({path:path.join(snapshots,name+'.png')});
+  const dashboard=async()=>{
+    await page.locator('.sidebar [data-nav=dashboard]').click();
+    await page.locator('button.metric').first().waitFor();
+  };
+  const openCase=async caseId=>{
+    await page.goto(process.env.GAPYEAR_BROWSER_URL+'/#case/'+caseId);
+    await page.locator('#latest-inquiry').waitFor();
+  };
+  try {
+    await page.goto(process.env.GAPYEAR_BROWSER_URL);
+    await page.locator('#login-form [name=username]').fill('browser-reviewer');
+    await page.locator('#login-form [name=password]').fill(process.env.GAPYEAR_BROWSER_PASSWORD);
+    await page.locator('#login-form button').click();
+    await page.locator('button.metric').first().waitFor();
+    assert.equal(await page.locator('button.metric').count(),8);
+    for(const queue of ['new_inquiries','state_selection','draft_review','today_followups','staff_check','errors']) {
+      const card=page.locator(`button.metric[data-queue=${queue}]`);
+      const expected=Number(await card.locator('.metric-num').innerText());
+      await card.click();
+      await page.locator('#case-count').waitFor();
+      assert.equal(await page.locator('#case-table tbody tr').count(),expected);
+      await dashboard();
+    }
+    console.log('PASS dashboard cards open matching filtered queues and counts');
+    await page.getByRole('button',{name:'검수 문의 열기',exact:true}).click();
+    await page.locator('#state-form').waitFor();
+    const caseId=await page.evaluate(()=>currentCase.id);
+    assert.ok(await page.evaluate(()=>Boolean(document.querySelector('#latest-inquiry').compareDocumentPosition(document.querySelector('#state-form')) & Node.DOCUMENT_POSITION_FOLLOWING)));
+    await capture('latest-inquiry');
+    await page.locator('#state-form [value=S4]').check();
+    await page.locator('#state-form button').click();
+    await page.locator('[data-action=generate-draft]:enabled').click();
+    await page.locator('#draft-form textarea').waitFor();
+    assert.match(await page.locator('#draft-form').innerText(),/모의 응답/);
+    const answer=(await page.locator('#draft-form textarea').inputValue())+'\n직원 검토: 희망 시작일을 확인해주세요.';
+    await page.locator('#draft-form textarea').fill(answer);
+    await page.locator('#case-form button[type=submit]').click();
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),answer);
+    await page.waitForFunction(()=>document.querySelector('#draft-save-status')?.textContent==='저장 완료');
+    await page.reload();
+    await page.locator('#draft-form textarea').waitFor();
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),answer);
+    await dashboard();await openCase(caseId);
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),answer);
+    console.log('PASS edit > consultation save > autosave > reload > leave and return preserves answer');
+
+    const failedAnswer=answer+'\n연결 실패 중 작성 내용';
+    await page.route('**/api/drafts/*',route=>route.request().method()==='PUT'?route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({detail:'검증용 저장 장애'})}):route.continue());
+    await page.locator('#draft-form textarea').fill(failedAnswer);
+    await page.waitForFunction(()=>document.querySelector('#draft-save-status')?.textContent.includes('저장 실패'));
+    await page.locator('#case-form button[type=submit]').click();
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),failedAnswer);
+    const refreshDialog=page.waitForEvent('dialog');
+    await page.evaluate(()=>setTimeout(()=>location.reload(),0));
+    const unsavedWarning=await refreshDialog;
+    assert.equal(unsavedWarning.type(),'beforeunload');
+    await unsavedWarning.dismiss();
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),failedAnswer);
+    let warning='';
+    page.once('dialog',async dialog=>{warning=dialog.message();await dialog.dismiss();});
+    await page.locator('.sidebar [data-nav=dashboard]').click();
+    await page.waitForFunction(()=>location.hash.startsWith('#case/'));
+    assert.match(warning,/저장되지 않은 답변/);
+    assert.equal(await page.locator('#draft-form textarea').inputValue(),failedAnswer);
+    await page.unroute('**/api/drafts/*');
+    await page.locator('#draft-form button[type=submit]').click();
+    await page.waitForFunction(()=>document.querySelector('#draft-save-status')?.textContent==='저장 완료');
+    console.log('PASS failed autosave retains text; native refresh and navigation warnings protect unsaved edits');
+
+    const second=await context.newPage();
+    await second.goto(process.env.GAPYEAR_BROWSER_URL+'/#case/'+caseId);
+    await second.locator('#draft-form textarea').waitFor();
+    await page.locator('#draft-form textarea').fill(answer+'\n첫 창의 최신 수정');
+    await page.waitForFunction(()=>document.querySelector('#draft-save-status')?.textContent==='저장 완료');
+    await second.locator('#draft-form textarea').fill(answer+'\n다른 창의 수정');
+    await second.waitForFunction(()=>document.querySelector('#draft-save-status')?.textContent.includes('충돌'));
+    await second.locator('[data-action=resolve-draft]').click();
+    await second.locator('#draft-merge-form').waitFor();
+    assert.match(await second.locator('#modal').innerText(),/첫 창의 최신 수정/);
+    await second.locator('#draft-merge-form [type=checkbox]').check();
+    await second.locator('#draft-merge-form button').click();
+    await second.locator('#modal').waitFor({state:'hidden'});
+    await second.close();
+    await page.reload();await page.locator('#draft-form textarea').waitFor();
+    assert.match(await page.locator('#draft-form textarea').inputValue(),/다른 창의 수정/);
+    console.log('PASS concurrent windows detect stale draft and require explicit merge');
+
+    page.once('dialog',dialog=>dialog.dismiss());
+    const draftId=await page.locator('#draft-form').getAttribute('data-id');
+    await page.locator('[data-action=generate-draft]').click();
+    assert.equal(await page.locator('#draft-form').getAttribute('data-id'),draftId);
+    const finalBody=await page.locator('#draft-form textarea').inputValue();
+    await page.locator('[data-action=review-send]').click();
+    await page.locator('#send-form').waitFor();
+    await capture('final-approval');
+    await page.locator('#send-form [type=checkbox]').check();
+    await page.locator('#send-form button').click();
+    await page.waitForFunction(()=>currentCase.jobs.length===5);
+    assert.equal(await page.evaluate(()=>currentCase.outbox.find(o=>o.status==='sent').body),finalBody);
+    const before=await page.evaluate(()=>currentCase.jobs.map(j=>({id:j.id,due:j.due_at,status:j.status})));
+    await page.locator('#state-form button').click();
+    await page.waitForFunction(()=>document.querySelector('#state-form button')?.disabled===false);
+    assert.deepEqual(await page.evaluate(()=>currentCase.jobs.map(j=>({id:j.id,due:j.due_at,status:j.status}))),before);
+    await page.locator('#case-form button[type=submit]').click();
+    assert.deepEqual(await page.evaluate(()=>currentCase.jobs.map(j=>({id:j.id,due:j.due_at,status:j.status}))),before);
+    console.log('PASS approved final edited body sent to mock Gmail; same S4/memo save preserves all five reservations');
+
+    await page.locator('.demo-tools summary').click();
+    await page.locator('[data-action=demo-reply]').click();
+    await page.locator('#demo-reply-form button').click();
+    await page.waitForFunction(()=>currentCase.jobs.length===5&&currentCase.jobs.every(j=>j.status==='cancelled'));
+    assert.ok(await page.locator('[data-action=generate-draft]').isDisabled());
+    await page.locator('#state-form button').click();
+    await page.locator('[data-action=generate-draft]:enabled').click();
+    await page.locator('#draft-form textarea').waitFor();
+    console.log('PASS inbound reply cancels remaining jobs; same S4 reselection permits new draft');
+    await page.locator('.sidebar [data-nav=settings]').click();
+    await page.locator('.operation-card').first().waitFor();
+    assert.equal(await page.locator('.operation-card').count(),4);
+    assert.ok(await page.locator('[data-action=gmail-connect]').isDisabled());
+    assert.match(await page.locator('#main').innerText(),/연결 대기|모의/);
+    await capture('admin-operations');
+    await page.setViewportSize({width:390,height:844});
+    await openCase(caseId);
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1));
+    await capture('mobile-latest-inquiry');
+    assert.deepEqual(errors,[]);
+    console.log('PASS admin four operation states and mobile layout; no JavaScript runtime errors');
+  } finally {await browser.close();}
+})().catch(error=>{console.error(error);process.exitCode=1;});

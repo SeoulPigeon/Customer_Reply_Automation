@@ -1,0 +1,12 @@
+.venv/
+var/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+*.sqlite*
+*.db
+*.db-*
+credentials*.json
+token*.json
+backups/

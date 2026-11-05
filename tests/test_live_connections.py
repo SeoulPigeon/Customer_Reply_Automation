@@ -213,7 +213,7 @@ def test_openai_daily_limit_blocks_network_and_alerts(tmp_path):
     ai.configure_usage_limits({'daily_requests':1,'daily_tokens':250000,'alert_percent':80})
     ai.generate({'state':'S4','latest_inquiry':'참가 가능한가요?'})
     assert ai.usage_status()['alert'] is True
-    with pytest.raises(IntegrationError,match='daily usage limit'):
+    with pytest.raises(IntegrationError,match='일일 사용량 제한'):
         ai.generate({'state':'S4','latest_inquiry':'새 요청'})
     assert len(calls)==1
 

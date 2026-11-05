@@ -33,6 +33,78 @@ class IntegrationError(RuntimeError):
     """A read/configuration failure. The caller must fail closed."""
 
 
+class OpenAIError(IntegrationError):
+    """Allowlisted, user-facing failures without provider text or credentials."""
+
+    MESSAGES = {
+        'openai_configuration_required': ('서버에 OpenAI API 키와 사용할 모델을 설정한 뒤 연결을 확인하세요.', False),
+        'openai_authentication_failed': ('OpenAI API 키 인증에 실패했습니다. 서버의 API 키가 유효한지 확인하세요.', False),
+        'openai_model_unavailable': ('설정한 OpenAI 모델을 찾을 수 없거나 접근 권한이 없습니다. 모델 이름과 해당 프로젝트의 모델 권한을 확인하세요.', False),
+        'openai_access_denied': ('OpenAI 요청 권한이 없습니다. API 키의 프로젝트·조직 권한과 서비스 이용 가능 지역을 확인하세요.', False),
+        'openai_quota_exceeded': ('OpenAI API 사용 가능 잔액 또는 결제 한도에 도달했습니다. OpenAI 프로젝트의 결제·사용 한도를 확인하세요.', False),
+        'openai_rate_limited': ('OpenAI의 일시적인 요청 한도에 도달했습니다. 잠시 후 다시 시도하세요.', True),
+        'openai_timeout': ('OpenAI 응답 시간이 초과되었습니다. 연결 상태를 확인한 뒤 다시 시도하세요.', True),
+        'openai_network_error': ('OpenAI에 연결할 수 없습니다. 인터넷 연결과 서버의 외부 접속 허용 설정을 확인하세요.', True),
+        'openai_service_unavailable': ('OpenAI 서비스가 일시적으로 요청을 처리하지 못했습니다. 잠시 후 다시 시도하세요.', True),
+        'openai_request_rejected': ('OpenAI가 요청을 처리하지 못했습니다. 설정한 모델이 현재 답변 생성 방식과 요청 형식을 지원하는지 확인하세요.', False),
+        'openai_invalid_response': ('OpenAI 응답 형식이 올바르지 않거나 생성이 완료되지 않았습니다. 다시 생성한 뒤 직원이 검토하세요.', True),
+        'openai_local_budget_exceeded': ('이 사이트에 설정한 OpenAI 일일 사용량 제한에 도달했습니다. 관리자가 사용량과 제한을 확인하세요.', False),
+        'openai_context_too_large': ('OpenAI에 전달할 상담 내용이 너무 깁니다. 필요한 이전 상담 내용을 줄인 뒤 다시 생성하세요.', False),
+    }
+
+    def __init__(self, code: str, http_status: int | None = None):
+        self.code = code if code in self.MESSAGES else 'openai_request_rejected'
+        self.message, self.retryable = self.MESSAGES[self.code]
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        super().__init__(self.message)
+
+    def public_details(self) -> dict:
+        return {'provider': 'openai', 'code': self.code, 'message': self.message,
+                'retryable': self.retryable, 'http_status': self.http_status}
+
+
+def _openai_response(response: httpx.Response) -> dict:
+    """Inspect only known error identifiers; never copy error.message into output."""
+    status = response.status_code
+    if status >= 400:
+        identifiers = set()
+        try:
+            payload = response.json()
+            error = payload.get('error') if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                identifiers = {value for key in ('code', 'type')
+                               if isinstance((value := error.get(key)), str) and len(value) <= 80}
+        except (ValueError, TypeError):
+            pass
+        if status == 401:
+            code = 'openai_authentication_failed'
+        elif identifiers & {'model_not_found', 'model_not_available', 'model_access_denied'} or status == 404:
+            code = 'openai_model_unavailable'
+        elif identifiers & {'insufficient_quota', 'billing_hard_limit_reached', 'billing_not_active',
+                            'billing_limit_reached', 'usage_limit_reached'} or status == 402:
+            code = 'openai_quota_exceeded'
+        elif status == 403:
+            code = 'openai_access_denied'
+        elif status == 429:
+            code = 'openai_rate_limited'
+        elif status in (408, 504):
+            code = 'openai_timeout'
+        elif status >= 500:
+            code = 'openai_service_unavailable'
+        elif 'context_length_exceeded' in identifiers:
+            code = 'openai_context_too_large'
+        else:
+            code = 'openai_request_rejected'
+        raise OpenAIError(code, status) from None
+    try:
+        result = response.json()
+    except (ValueError, TypeError):
+        raise OpenAIError('openai_invalid_response', status) from None
+    if not isinstance(result, dict):
+        raise OpenAIError('openai_invalid_response', status)
+    return result
+
+
 class ReauthenticationRequired(IntegrationError):
     """Google grant expired or was revoked; an administrator must reconnect."""
 
@@ -680,7 +752,7 @@ class OpenAIDrafter:
 
     def _headers(self):
         if not self.api_key or not self.model:
-            raise IntegrationError("OpenAI API key and an accessible model must be configured")
+            raise OpenAIError('openai_configuration_required')
         return {"Authorization": "Bearer " + self.api_key}
 
     def usage_status(self):
@@ -707,12 +779,12 @@ class OpenAIDrafter:
         # changes, recipients and send approvals are never model capabilities.
         context_text = json.dumps(context, ensure_ascii=False, default=str)
         if len(context_text.encode()) > 120000:
-            raise IntegrationError("Consultation context is too large; reduce previous history before generation")
+            raise OpenAIError('openai_context_too_large')
         reserved_tokens = len((DRAFT_POLICY + context_text).encode()) + self.max_output_tokens + 100
         try:
             reservation = self.budget.reserve(reserved_tokens, self.model)
-        except ValueError as exc:
-            raise IntegrationError(str(exc)) from exc
+        except ValueError:
+            raise OpenAIError('openai_local_budget_exceeded') from None
         try:
             response = self.client.post("https://api.openai.com/v1/chat/completions",
                 headers=headers, json={
@@ -723,15 +795,18 @@ class OpenAIDrafter:
                     "max_completion_tokens": self.max_output_tokens,
                     "store": False,
                 })
-        except httpx.HTTPError as exc:
+        except httpx.TimeoutException:
             self.budget.finish(reservation, status="error")
-            raise IntegrationError("OpenAI draft generation connection failed; no mock answer substituted") from exc
+            raise OpenAIError('openai_timeout') from None
+        except httpx.HTTPError:
+            self.budget.finish(reservation, status="error")
+            raise OpenAIError('openai_network_error') from None
         try:
-            result = _safe_response(response, "OpenAI draft generation")
+            result = _openai_response(response)
         except IntegrationError:
             self.budget.finish(reservation, status="error")
             raise
-        raw_usage = result.get("usage") or {}
+        raw_usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         usage = {k: raw_usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
                  if type(raw_usage.get(k)) is int and raw_usage[k] >= 0}
         request_id = response.headers.get("x-request-id") or result.get("id")
@@ -748,9 +823,9 @@ class OpenAIDrafter:
                 raise ValueError("invalid body")
             if not isinstance(checks, list) or len(checks) > 50 or any(not isinstance(c, str) or len(c) > 2000 for c in checks):
                 raise ValueError("invalid checks")
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError):
             self.budget.finish(reservation, tokens=usage.get("total_tokens"), request_id=request_id, model=returned_model, status="invalid_response")
-            raise IntegrationError("OpenAI returned an invalid draft; staff review required") from exc
+            raise OpenAIError('openai_invalid_response', response.status_code) from None
         self._verified_model = self.model
         return {"body": body, "checks": checks, "provider": "openai", "model": returned_model,
                 "generated_at": _utc(), "request_id": request_id, "usage": usage}

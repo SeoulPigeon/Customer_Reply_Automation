@@ -12,7 +12,9 @@
 
 초안 자동 저장·동시 편집 충돌 감지, 같은 상태 저장 시 예약 유지, 최신 문의 우선 배치와 대시보드 카드 이동을 개선했습니다. 직원 화면은 필요한 입력과 다음 할 일을 먼저 표시하고 상세 정보는 접습니다. Gmail 연결은 관리자 OAuth 화면으로 진행합니다.
 
-현재 우선 배포안은 [Render 웹 서비스 1개·영속 디스크 1GB](docs/RENDER_DEPLOYMENT.md)입니다. 비용 확인·사용자 승인·실제 서비스 생성·외부 API 인증은 대기 중이며 발급된 운영 HTTPS 주소는 없습니다. [최신 진행표와 사용자가 직접 할 작업](docs/LIVE_ROLLOUT.md)에서 비용·인증·실제 메일 확인 순서를 확인하세요. 기존 [Linux VPS 배포 구성](docs/DEPLOYMENT.md)은 대안으로 유지합니다.
+**현재 우선 작업은 맥북의 기존 `http://127.0.0.1:8001` 사이트에서 실제 Gmail·OpenAI를 연결하는 것**입니다. [맥북 실제 연결 안내](docs/LOCAL_LIVE_CONNECTION.md)에 따라 `python -m app.local_live init`으로 새 개인 계정과 Git 제외 비밀 설정을 준비하고 `python -m app.local_live start`로 실행합니다. 기존 모의 DB와 실제 연결 DB는 분리되며, `.env`는 자동으로 읽지 않습니다. 실제 API 인증·발송 성공은 사용자 맥북에서 확인해야 합니다.
+
+Render 도입·비용 확인·배포와 회사 서버 이전은 현재 작업에서 진행하지 않습니다. 이전 [Render 준비 기록](docs/LIVE_ROLLOUT.md)과 [Linux 서버 배포 구성](docs/DEPLOYMENT.md)은 별도 이전 작업의 참고 자료입니다.
 
 ## 로컬 실행
 
@@ -57,7 +59,7 @@ python -m app.cli create-user --username staff --role staff
 | S4·S5 | 1, 3, 7, 14, 30 |
 | S6 | 1, 2, 5, 7, 14 — 직원 확인 후 발송 |
 
-현재 배포·연동 상태와 운영 전 미해결 항목은 [최신 진행표](docs/LIVE_ROLLOUT.md), 이전 사용성 개선 결과는 [이전 개발 보고서](docs/IMPLEMENTATION_REPORT.md)에 정리했습니다.
+현재 실제 연결 경로·사용자 작업·검증 대기 항목은 [맥북 실제 연결 안내](docs/LOCAL_LIVE_CONNECTION.md), 이전 사용성 개선 결과는 [이전 개발 보고서](docs/IMPLEMENTATION_REPORT.md)에 정리했습니다.
 
 ## 검증
 

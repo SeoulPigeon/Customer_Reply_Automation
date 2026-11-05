@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth import Auth
 from app.core import Service
-from app.integrations import IntegrationError, gmail_from_env, drafter_from_env, sheets_from_env
+from app.integrations import IntegrationError, OpenAIError, gmail_from_env, drafter_from_env, sheets_from_env
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +46,7 @@ class Login(BaseModel):
 
 def create_app(service=None, auth=None, scheduler=None, demo=None):
     production = os.getenv('APP_ENV', 'development') == 'production'
+    personal_accounts = production or os.getenv('APP_REQUIRE_PRODUCTION_ACCOUNTS', 'false').lower() == 'true'
     base_url = os.getenv('APP_BASE_URL', '').rstrip('/')
     if production:
         parsed = urlparse(base_url)
@@ -62,8 +63,8 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
     if service is None:
         service = Service(str(path), gmail_from_env(str(path)), drafter_from_env(str(path)))
         service.initialize(str(ROOT / 'data' / 'followup_templates.xlsx'))
-    auth = auth or Auth(service.db_path, production=production)
-    if production and not auth.production:
+    auth = auth or Auth(service.db_path, production=personal_accounts)
+    if personal_accounts and not auth.production:
         raise ValueError('운영용 직원 인증 설정이 필요합니다.')
     enabled = scheduler if scheduler is not None else os.getenv('ENABLE_SCHEDULER', 'true').lower() == 'true'
     if demo:
@@ -124,7 +125,7 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        if production and enabled and not service.gmail.is_mock:
+        if enabled and not service.gmail.is_mock:
             # A stopped server must not release elapsed live jobs on its first
             # scheduler tick. Staff review preserves original dates and history.
             await asyncio.to_thread(service.hold_overdue_after_restart)
@@ -138,7 +139,7 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
     app = FastAPI(title='한국갭이어 상담 관리', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service, app.state.auth, app.state.runtime = service, auth, runtime
     app.state.tick = tick
-    if production:
+    if production or (personal_accounts and urlparse(base_url).hostname in ('127.0.0.1', 'localhost', '::1')):
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=[urlparse(base_url).hostname])
 
     @app.middleware('http')
@@ -162,6 +163,12 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
         return JSONResponse({'detail': str(exc)}, status_code=409)
+
+    @app.exception_handler(OpenAIError)
+    async def openai_failure(request, exc):
+        # A provider's 401 is not a staff-session failure. Only fixed safe text
+        # is returned; provider bodies may contain credentials or inquiry text.
+        return JSONResponse({'detail': exc.message, **exc.public_details()}, status_code=503)
 
     @app.exception_handler(Exception)
     async def unexpected(request, exc):
@@ -263,6 +270,9 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
         try:
             result = service.generate_draft(case_id, user['username'], regenerate=regenerate, expected_version=version)
             return result
+        except OpenAIError as exc:
+            record('openai_draft', False, details=exc.public_details(), error=exc.message)
+            raise
         except IntegrationError as exc:
             record('openai_draft', False, error=type(exc).__name__)
             raise
@@ -375,6 +385,9 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
                 adapter = factory()
                 results[key] = adapter.verify() if adapter else {'configured': False}
                 record(key + '_connection', True, results[key])
+            except OpenAIError as exc:
+                results[key] = {'ok': False, 'error': exc.message, **exc.public_details()}
+                record(key + '_connection', False, details=exc.public_details(), error=exc.message)
             except Exception as exc:
                 results[key] = {'ok': False, 'error': type(exc).__name__}
                 record(key + '_connection', False, error=type(exc).__name__)
@@ -406,7 +419,8 @@ def create_app(service=None, auth=None, scheduler=None, demo=None):
         ai_mock = service.drafter.is_mock
         collection = collection_status()
         poll_status = telemetry.get('gmail_poll', {})
-        ai_status = telemetry.get('openai_draft') or telemetry.get('openai_connection', {})
+        ai_status = max((telemetry.get('openai_draft', {}), telemetry.get('openai_connection', {})),
+                        key=lambda observation: observation.get('last_attempt_at') or '')
         def capability(mock, configured, observation, stopped=False):
             state = ('stopped' if stopped else 'normal' if mock else 'waiting' if not configured else
                      'error' if observation.get('ok') is False else 'normal' if observation.get('ok') else 'waiting')

@@ -217,7 +217,7 @@ def test_openai_rejects_malformed_draft_and_unavailable_model():
             return httpx.Response(200, json={"id": "model"})
         return httpx.Response(200, json={"choices": [{"message": {"content": "not JSON"}}]})
     ai = OpenAIDrafter("test-key", "model", client_for(handler))
-    with pytest.raises(IntegrationError, match="invalid draft"):
+    with pytest.raises(IntegrationError, match="응답 형식"):
         ai.generate({})
 
 

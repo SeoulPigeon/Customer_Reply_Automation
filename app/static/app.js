@@ -34,16 +34,25 @@ async function api(path,method='GET',body) {
 }
 function brand(){return '<div class="brand"><div class="brand-mark">g</div><div><strong>한국갭이어</strong><small>COUNSELING WORKSPACE</small></div></div>';}
 function renderLogin(){ $('#app').innerHTML=`<div class="login-page"><section class="login-story">${brand()}<div><div class="eyebrow soft-teal">A LITTLE HELP, A BIG CHANGE</div><h1>고객의 다음 한 걸음을<br>함께 만드는 공간.</h1><p>고객의 이야기를 듣고, 필요한 안내를 전하고,<br>다음 연락까지 놓치지 않도록.<br>한국갭이어 상담 워크스페이스입니다.</p><div class="login-art"><span></span><i></i><span></span><i></i><span></span></div></div><footer>한국갭이어 · 직원 전용 상담 관리 시스템</footer></section><section class="login-form-wrap"><form id="login-form" class="login-form"><div class="eyebrow">WELCOME BACK</div><h2>직원 로그인</h2><p class="muted">계정에 로그인하고 오늘의 상담을 시작하세요.</p><label class="field">아이디<input name="username" autocomplete="username" required autofocus></label><label class="field">비밀번호<input name="password" type="password" autocomplete="current-password" required></label><p id="login-error" class="error-text" role="alert"></p><button class="btn primary" type="submit">워크스페이스 입장 →</button><p class="login-note">계정이 없다면 관리자에게 발급을 요청하세요.<br>첫 관리자 계정은 서버의 초기 설정 명령으로 생성합니다.</p></form></section></div>`;}
-function shell(){const navs=[['dashboard','대시보드'],['cases','고객 상담'],['jobs','후속관리 현황'],['templates','후속 문구'],['calls','전화 문의']];if(user.role==='admin')navs.push(['settings','관리자 설정']);$('#app').innerHTML=`<div class="shell"><aside class="sidebar">${brand()}<div class="nav-label">WORKSPACE</div><nav class="nav" aria-label="주 메뉴">${navs.map(([key,title])=>`<button data-nav="${key}" class="${currentPage===key?'active':''}">${icons[key]}${title}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-note">직원이 판단하고,<br>자동화가 다음 연락을 돕습니다.<br><br>기본 시간대 · 서울</div></div></aside><div class="main-wrap"><header class="topbar"><div class="breadcrumb">상담 워크스페이스 <span aria-hidden="true"> / </span> <span id="breadcrumb-page"></span></div><div class="top-actions"><span class="pill ${settings.mode==='live'?'amber':'teal'}"><span class="dot"></span>${settings.mode==='live'?'실제 연동 모드':'모의 운영 모드'}</span><div class="user"><div class="avatar">${esc(user.username.slice(0,1).toUpperCase())}</div><div class="user-name">${esc(user.username)}<small>${user.role==='admin'?'관리자':'일반 직원'}</small></div></div><button class="btn ghost small" data-action="logout">로그아웃</button></div></header><main id="main" class="main"></main></div></div>`;}
-function pageHeading(title,subtitle,actions='',eyebrow='COUNSELING WORKSPACE'){return demoPanel()+`<div class="page-heading"><div><div class="eyebrow">${eyebrow}</div><h1>${title}</h1><p>${subtitle}</p></div><div class="actions">${actions}</div></div>`;}
-async function refreshDemo(caseId){demo=await api(`/demo${caseId?`?case_id=${encodeURIComponent(caseId)}`:''}`);return demo;}
+function shell(){const navs=[['dashboard','대시보드'],['cases','고객 상담'],['jobs','후속관리 현황'],['templates','후속 문구'],['calls','전화 문의']];if(user.role==='admin')navs.push(['settings','관리자 설정']);$('#app').innerHTML=`<div class="shell"><aside class="sidebar">${brand()}<div class="nav-label">WORKSPACE</div><nav class="nav" aria-label="주 메뉴">${navs.map(([key,title])=>`<button data-nav="${key}" class="${currentPage===key?'active':''}">${icons[key]}${title}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-note">직원이 판단하고,<br>자동화가 다음 연락을 돕습니다.<br><br>기본 시간대 · 서울</div></div></aside><div class="main-wrap"><header class="topbar"><div class="breadcrumb">상담 워크스페이스 <span aria-hidden="true"> / </span> <span id="breadcrumb-page"></span></div><div class="top-actions"><button id="demo-tools-button" class="btn ghost small" data-action="open-demo-tools" aria-haspopup="dialog"${settings.demo?'':' hidden'}>검수 도구</button><span class="pill ${settings.mode==='live'?'amber':'teal'}"><span class="dot"></span>${settings.mode==='live'?'실제 연동 모드':'모의 운영 모드'}</span><div class="user"><div class="avatar">${esc(user.username.slice(0,1).toUpperCase())}</div><div class="user-name">${esc(user.username)}<small>${user.role==='admin'?'관리자':'일반 직원'}</small></div></div><button class="btn ghost small" data-action="logout">로그아웃</button></div></header><main id="main" class="main"></main></div></div>`;}
+function pageHeading(title,subtitle,actions='',eyebrow='COUNSELING WORKSPACE'){return `<div class="page-heading"><div><div class="eyebrow">${eyebrow}</div><h1>${title}</h1><p>${subtitle}</p></div><div class="actions">${actions}</div></div>`;}
+async function refreshDemo(caseId){
+  demo=await api(`/demo${caseId?`?case_id=${encodeURIComponent(caseId)}`:''}`);
+  const button=$('#demo-tools-button');
+  if(button)button.hidden=!demo.enabled;
+  return demo;
+}
+async function openDemoTools(){
+  await refreshDemo(currentCase?.id);
+  if(demo.enabled)openModal('검수 도구',demoPanel());
+}
 function demoPanel(){
  if(!demo.enabled)return '';
  const caseId=demo.case_id, base=demo.base_sent_at, days=demo.days||[1,3,7,14,30];
  const ready=!!base;
  return `<section class="demo-panel" aria-label="직접 검수 도구"><div class="demo-panel-head"><div><span class="eyebrow">STAFF TEST DRIVE</span><h2>직접 검수 · 실제 발송 차단</h2><p>모의 Gmail과 <strong>모의 응답</strong>을 사용합니다. 실제 GPT가 생성한 답변이 아닙니다.</p></div><div class="demo-clock"><span>테스트 시각 · 서울</span><strong>${fullFmt(demo.now)}</strong><small>기준 답장 발송: ${base?fullFmt(base):'아직 발송하지 않음'}</small></div></div><div class="demo-guide"><p><b>① 무응답 검수</b> 문의 확인 → S4 선택 → 모의 응답 수정·승인 → 모의 발송 후 아래 버튼을 순서대로 누르세요.</p><p><b>② 고객 답장 검수</b> 첫 후속 연락 후 고객 답장을 접수하면 남은 예약이 취소됩니다. 새 검수 문의를 만들면 기존 기록을 유지하면서 별도로 반복할 수 있습니다.</p></div><div class="demo-schedule">${days.map((day,i)=>{const passed=base&&Date.parse(base)+Number(day)*86400000<=Date.parse(demo.now);return `<button class="demo-day" data-action="demo-advance" data-day="${Number(day)}" data-id="${esc(caseId||'')}"${!ready||passed?' disabled':''}><strong>기준 답장 +${Number(day)}일</strong><span>S4-${String(i+1).padStart(2,'0')}</span><small>${passed?'이미 지난 시점':'시간 이동 · 예약 실행'}</small></button>`;}).join('')}</div><p class="demo-footnote">1·3·7·14·30일은 누적 일정입니다. 주말·영업시간 밖이면 다음 발송 가능 시간으로 이동합니다. 테스트 데이터에서 승인된 문구: ${esc((demo.approved_templates||[]).join(', ')||'없음')}.</p><div class="actions">${caseId?`<button class="btn primary small" data-nav="case/${esc(caseId)}">검수 문의 열기</button><button class="btn small" data-action="demo-reply" data-id="${esc(caseId)}">고객 답장 접수 · 예약 취소 확인</button>`:''}<button class="btn small" data-action="demo-scenario">＋ 새 검수 문의</button></div></section>`;
 }
-async function showDemoCase(caseId){if(location.hash===`#case/${caseId}`)await renderCase(caseId);else location.hash=`case/${caseId}`;}
+async function showDemoCase(caseId){closeModal();if(location.hash===`#case/${caseId}`)await renderCase(caseId);else location.hash=`case/${caseId}`;}
 function demoReplyModal(caseId){openModal('테스트 고객 답장 접수',`<div class="notice">가상 고객의 새 답장을 기록하고 이 고객의 남은 후속 예약을 취소합니다.</div><form id="demo-reply-form" data-id="${esc(caseId)}"><label class="field">고객 답장<textarea name="body" rows="4" required>1월 출발 일정을 다시 확인하고 싶습니다. 3주 기준으로 필요한 조건을 알려주세요.</textarea></label><button class="btn primary" type="submit">모의 답장 접수</button></form>`);}
 function empty(title,body,action=''){return `<div class="empty"><div class="empty-symbol" aria-hidden="true">○</div><h3>${title}</h3><p>${body}</p>${action}</div>`;}
 function caseRows(rows){return rows.map(c=>`<tr><td><button class="row-link" data-nav="case/${esc(c.id)}"><strong>${esc(c.name||'이름 미등록')}</strong><small>${esc(c.email||c.phone||'연락처 미등록')}</small></button></td><td><button class="row-link" data-nav="case/${esc(c.id)}">${esc(c.subject||'전화 상담')}</button><br><small>${c.channel==='phone'?'전화':'이메일'} · ${esc(c.owner||'담당 미지정')}</small></td><td>${statePill(c.state)}</td><td>${statusPill(c.workflow)}</td><td>${fmt(c.next_due||c.updated_at)}</td><td><button class="btn small" data-nav="case/${esc(c.id)}">상담 열기 ↗</button></td></tr>`).join('');}
@@ -299,9 +308,7 @@ async function renderCase(id) {
   [currentCase,templates] = await Promise.all([api(`/cases/${encodeURIComponent(id)}`),api('/templates')]);
   const c=currentCase, drafts=c.drafts||[], draft=drafts.find(d=>d.status==='draft');
   jobs=c.jobs||[];
-  const oldDemo=demo.enabled; demo.enabled=false;
   const heading=pageHeading(esc(c.name||'고객 상담'),esc(c.subject||'전화 상담'),`<button class="btn" data-nav="cases">← 상담 목록</button>${settings.mode!=='live'&&c.email?'<button class="btn" data-action="mock-reply">모의 고객 답장</button>':''}`,'CUSTOMER DETAIL');
-  demo.enabled=oldDemo;
   $('#main').innerHTML=heading+`<div class="detail-meta"><span>담당 ${esc(c.owner||'미지정')}</span><span>상담 #${esc(c.id)}</span></div>`+latestInquiryHTML(c)+
     (demo.enabled?`<details class="demo-tools"><summary>검수 도구 · 시간 이동 / 고객 답장 접수</summary>${demoPanel()}</details>`:'')+
     `<div class="split section-gap"><div class="consultation-flow">
@@ -495,7 +502,9 @@ document.addEventListener('click',event=>{
   runButton(button,async()=>{
     const id=button.dataset.id;
     switch(action){
+      case 'open-demo-tools':await openDemoTools();break;
       case 'demo-advance': {
+        if(!(await guardDraftNavigation()))return;
         const result=await api('/demo/advance','POST',{day:Number(button.dataset.day),case_id:id});
         await showDemoCase(id);toast(`테스트 시각을 ${fullFmt(result.now||result.effective_at)}으로 이동했습니다.`);break;
       }
@@ -504,7 +513,7 @@ document.addEventListener('click',event=>{
         if(!(await guardDraftNavigation()))return;
         const result=await api('/demo/scenario','POST',{}),caseId=result.case_id||result.id||result.case?.id;
         if(!caseId)throw new Error('검수 문의 생성 결과를 확인할 수 없습니다.');
-        location.hash=`case/${caseId}`;toast('새 검수 문의를 등록했습니다. 직원이 상태를 선택해 주세요.');break;
+        closeModal();location.hash=`case/${caseId}`;toast('새 검수 문의를 등록했습니다. 직원이 상태를 선택해 주세요.');break;
       }
       case 'logout':
         if(!(await guardDraftNavigation()))return;

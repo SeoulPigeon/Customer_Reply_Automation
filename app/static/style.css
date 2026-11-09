@@ -13,6 +13,7 @@
 .demo-tools{margin:16px 0;color:var(--teal)}
 .demo-tools>summary{padding:10px 0;font-weight:600}
 .demo-tools .demo-panel{margin-top:8px}
+.modal-body>.demo-panel{margin-bottom:0}
 .save-feedback{display:flex;flex-direction:column;gap:3px;margin:8px 0 15px}
 .draft-save-status{font-size:12px;color:var(--teal)}
 .draft-save-status.unsaved,.draft-save-status.saving{color:var(--amber)}
@@ -41,3 +42,4 @@
 .admin-extras>summary{font-size:12px}.admin-extras[open]>summary{border-bottom:1px solid var(--line)}
 @media(max-width:1100px){.operation-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:720px){.operation-grid{gap:10px}.operation-card{padding:14px}.latest-inquiry .definition{grid-template-columns:65px 1fr}.latest-inquiry .message-body{font-size:13px}.consultation-flow .card-header{align-items:flex-start;flex-wrap:wrap}}
+@media(max-width:720px){.topbar{height:auto;min-height:65px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px;gap:8px}.top-actions{margin-left:auto;max-width:100%;flex-wrap:wrap;justify-content:flex-end}}
